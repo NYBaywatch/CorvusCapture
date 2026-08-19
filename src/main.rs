@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
 
+mod about;
 mod app;
 mod constants;
 mod singleinstance;
 mod toast;
+mod tray;
 
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::HiDpi::{
@@ -64,10 +66,10 @@ fn main() {
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
 
-    // Insertion point: plans 01-04/01-05 add tray and hotkey setup here,
-    // strictly after the window is created above (RESEARCH.md Pitfall 2 —
-    // crate event handlers must not PostMessage to main_hwnd before it
-    // exists).
+    // Insertion point: plan 01-05 adds hotkey setup here, strictly after
+    // the window is created above (RESEARCH.md Pitfall 2 — crate event
+    // handlers must not PostMessage to main_hwnd before it exists).
+    let _tray = tray::init().expect("failed to create tray icon");
 
     app::run_message_loop();
 }

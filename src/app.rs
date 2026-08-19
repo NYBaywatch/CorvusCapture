@@ -10,14 +10,18 @@ use std::sync::OnceLock;
 use windows::core::{Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostQuitMessage,
-    RegisterClassW, TranslateMessage, CW_USEDEFAULT, MSG, WM_DESTROY, WNDCLASSW, WS_OVERLAPPED,
+    RegisterClassW, TranslateMessage, CW_USEDEFAULT, MSG, SW_SHOWNORMAL, WM_DESTROY, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
+use crate::about;
 use crate::constants;
 use crate::singleinstance;
 use crate::toast;
+use crate::tray;
 
 /// Actions the app can perform. Phase 1 wires the routing seams; Phases
 /// 2-4 fill in the real behavior behind each variant.
@@ -110,12 +114,33 @@ pub fn run_message_loop() {
 pub fn dispatch(action: AppAction) {
     match action {
         AppAction::Exit => unsafe { PostQuitMessage(0) },
-        // Phase 4: open (or focus) the raw Win32 Settings window.
-        AppAction::OpenSettings => {}
-        // Phase 2: open constants::default_capture_dir() in Explorer.
-        AppAction::OpenCaptureFolder => {}
-        // Phase 1/5: show the standard MessageBox About dialog (D-06).
-        AppAction::ShowAbout => {}
+        // Phase 1 stub (TRAY-03): the real Settings window is Phase 4.
+        AppAction::OpenSettings => {
+            toast::show("Settings — coming in a later version");
+        }
+        AppAction::OpenCaptureFolder => {
+            let dir = constants::default_capture_dir();
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                // Same seam ERR-01 formalizes in Phase 2 -- toast the OS
+                // error rather than panicking.
+                toast::show(&format!("Couldn't open capture folder: {e}"));
+            } else {
+                let dir_str = dir.to_string_lossy();
+                let path = constants::to_wide(&dir_str);
+                let verb = constants::to_wide("open");
+                unsafe {
+                    ShellExecuteW(
+                        Some(main_hwnd()),
+                        PCWSTR(verb.as_ptr()),
+                        PCWSTR(path.as_ptr()),
+                        PCWSTR(std::ptr::null()),
+                        PCWSTR(std::ptr::null()),
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+        AppAction::ShowAbout => about::show(),
         // Phase 2: F9 fullscreen capture of the monitor under the cursor.
         AppAction::CaptureFullscreen => {}
         // Phase 2: Ctrl+F9 capture of the active (focused) window.
@@ -155,12 +180,21 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         m if m == constants::WM_APP_MENU => {
-            // Plan 01-04 fills in the wparam -> AppAction mapping
-            // (which tray menu item was selected).
+            match wparam.0 {
+                tray::MENU_INDEX_SETTINGS => dispatch(AppAction::OpenSettings),
+                tray::MENU_INDEX_OPEN_FOLDER => dispatch(AppAction::OpenCaptureFolder),
+                tray::MENU_INDEX_ABOUT => dispatch(AppAction::ShowAbout),
+                tray::MENU_INDEX_EXIT => dispatch(AppAction::Exit),
+                // Unknown indices are ignored rather than treated as a panic.
+                _ => {}
+            }
             LRESULT(0)
         }
         m if m == constants::WM_APP_TRAY => {
-            // Plan 01-04 fills in tray icon event handling (e.g. left-click).
+            // TRAY-03: left-click opens (the seam for) Settings.
+            if wparam.0 == tray::TRAY_INDEX_LEFT_CLICK {
+                dispatch(AppAction::OpenSettings);
+            }
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

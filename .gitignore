@@ -1,1 +1,4 @@
 .planning/
+
+# Rust build artifacts (Cargo.lock is committed — this is a binary crate)
+/target

@@ -16,6 +16,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::constants;
+use crate::singleinstance;
+use crate::toast;
 
 /// Actions the app can perform. Phase 1 wires the routing seams; Phases
 /// 2-4 fill in the real behavior behind each variant.
@@ -135,6 +137,13 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A registered message id is a runtime value and cannot appear in a
+    // `match` pattern, so it is checked ahead of the match below.
+    if msg == singleinstance::already_running_message() {
+        toast::show("Corvus Capture is already running");
+        return LRESULT(0);
+    }
+
     match msg {
         WM_DESTROY => {
             PostQuitMessage(0);

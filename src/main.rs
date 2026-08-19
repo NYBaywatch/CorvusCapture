@@ -2,6 +2,8 @@
 
 mod app;
 mod constants;
+mod singleinstance;
+mod toast;
 
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::HiDpi::{
@@ -36,16 +38,36 @@ fn verify_dpi_and_exit() -> ! {
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--verify-dpi") {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--verify-dpi") {
         verify_dpi_and_exit();
+    }
+
+    // Single-instance enforcement (TRAY-04, D-01) must run before any
+    // window, tray icon, or hotkey is created, so a rejected second launch
+    // produces zero side effects.
+    let _instance_guard = match singleinstance::acquire() {
+        Some(guard) => guard,
+        None => std::process::exit(0),
+    };
+
+    // Hidden dev affordance: `--toast-test <text>` proves the toast path
+    // end-to-end without waiting on a real hotkey/tray flow.
+    if let Some(idx) = args.iter().position(|a| a == "--toast-test") {
+        let text = args.get(idx + 1).cloned().unwrap_or_default();
+        let _hwnd = app::create_main_window().expect("failed to create main window");
+        toast::show(&text);
+        toast::run_until_dismissed();
+        std::process::exit(0);
     }
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
 
-    // Insertion point: plans 01-03 through 01-05 add single-instance,
-    // toast, tray, and hotkey setup here, strictly after the window is
-    // created above (RESEARCH.md Pitfall 2 — crate event handlers must
-    // not PostMessage to main_hwnd before it exists).
+    // Insertion point: plans 01-04/01-05 add tray and hotkey setup here,
+    // strictly after the window is created above (RESEARCH.md Pitfall 2 —
+    // crate event handlers must not PostMessage to main_hwnd before it
+    // exists).
 
     app::run_message_loop();
 }

@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::about;
 use crate::constants;
+use crate::hotkeys;
 use crate::singleinstance;
 use crate::toast;
 use crate::tray;
@@ -142,11 +143,18 @@ pub fn dispatch(action: AppAction) {
         }
         AppAction::ShowAbout => about::show(),
         // Phase 2: F9 fullscreen capture of the monitor under the cursor.
-        AppAction::CaptureFullscreen => {}
+        // D-07 stub proves the pump -> hotkey -> UI path end to end.
+        AppAction::CaptureFullscreen => {
+            toast::show("F9 — fullscreen capture (coming soon)");
+        }
         // Phase 2: Ctrl+F9 capture of the active (focused) window.
-        AppAction::CaptureActiveWindow => {}
+        AppAction::CaptureActiveWindow => {
+            toast::show("Ctrl+F9 — active window capture (coming soon)");
+        }
         // Phase 3: Shift+F9 frozen-overlay region capture.
-        AppAction::CaptureRegion => {}
+        AppAction::CaptureRegion => {
+            toast::show("Shift+F9 — region capture (coming soon)");
+        }
     }
 }
 
@@ -175,8 +183,12 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         m if m == constants::WM_APP_HOTKEY => {
-            // Plan 01-04/01-05 fill in the wparam -> AppAction mapping
-            // (which registered hotkey fired).
+            // wparam is the fired hotkey's runtime id, validated against
+            // the registered-hotkey map before dispatch (T-01-17); unknown
+            // ids are ignored rather than treated as a panic.
+            if let Some((_label, action_kind)) = hotkeys::lookup(wparam.0 as u32) {
+                dispatch(action_kind.to_action());
+            }
             LRESULT(0)
         }
         m if m == constants::WM_APP_MENU => {

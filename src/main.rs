@@ -3,6 +3,7 @@
 mod about;
 mod app;
 mod constants;
+mod hotkeys;
 mod singleinstance;
 mod toast;
 mod tray;
@@ -65,11 +66,12 @@ fn main() {
     }
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
-
-    // Insertion point: plan 01-05 adds hotkey setup here, strictly after
-    // the window is created above (RESEARCH.md Pitfall 2 — crate event
-    // handlers must not PostMessage to main_hwnd before it exists).
     let _tray = tray::init().expect("failed to create tray icon");
+
+    // Registered strictly after the window and tray exist (RESEARCH.md
+    // Pitfall 2). Kept alive for the process lifetime -- dropping it
+    // unregisters every hotkey.
+    let _hotkeys = hotkeys::init().expect("failed to initialize hotkeys");
 
     app::run_message_loop();
 }

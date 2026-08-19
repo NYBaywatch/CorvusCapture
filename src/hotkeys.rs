@@ -18,14 +18,6 @@ use crate::app::AppAction;
 use crate::constants;
 use crate::toast;
 
-/// Maps a registered hotkey's runtime id to its display label and the
-/// `AppAction` it will trigger (the Phase 2/3/4 seam).
-struct HotKeyBinding {
-    id: u32,
-    label: &'static str,
-    action_kind: ActionKind,
-}
-
 /// A `Copy`, non-`AppAction`-holding tag so the id map can live in a
 /// `OnceLock` without requiring `AppAction` to implement `Clone`/`Copy`.
 #[derive(Clone, Copy)]

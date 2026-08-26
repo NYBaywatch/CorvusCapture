@@ -8,8 +8,22 @@
 //! later task in this same file) ever run on the background worker thread;
 //! the UI thread's message pump is never blocked by either.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Mutex, OnceLock};
 
+use image::codecs::bmp::BmpEncoder;
+use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::codecs::webp::WebPEncoder;
+use image::{ExtendedColorType, ImageEncoder};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+use crate::app;
+use crate::capture::RawBitmap;
+use crate::config::{self, Config, Format};
 use crate::constants;
 
 // ---------------------------------------------------------------------
@@ -146,6 +160,237 @@ pub fn sweep_orphan_tmp(dir: &Path, base: &str) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Worker thread: encode + atomic write (SAVE-04, SAVE-05, SAVE-06, ERR-02)
+// ---------------------------------------------------------------------
+
+/// A reserved capture ready to be encoded and written by the worker thread.
+/// The number/path in `final_path` was already reserved synchronously on
+/// the UI thread before this job was sent (SAVE-03).
+pub struct SaveJob {
+    bitmap: RawBitmap,
+    final_path: PathBuf,
+    format: Format,
+    jpg_quality: u8,
+    advisory: Option<String>,
+}
+
+/// Result of one save job, posted back to the UI thread for the wnd_proc
+/// arm (plan 02-04) to drain via `take_result`.
+pub struct SaveOutcome {
+    pub file_name: String,
+    pub path: PathBuf,
+    pub error: Option<String>,
+    pub advisory: Option<String>,
+}
+
+/// Process-global handle to the worker's job sender, set once by `init`.
+/// Lets `reserve_and_dispatch` reach the worker without threading a handle
+/// through every call (same shape as `app::MAIN_HWND` / `hotkeys::HOTKEY_MAP`).
+static SAVE_TX: OnceLock<Sender<SaveJob>> = OnceLock::new();
+
+/// Completed outcomes waiting to be drained by the UI thread's wnd_proc,
+/// mirroring `toast.rs`'s `Mutex<String>` payload-alongside-message pattern.
+static SAVE_RESULTS: Mutex<VecDeque<SaveOutcome>> = Mutex::new(VecDeque::new());
+
+/// Single UI-thread-owned counter, guarded for interior mutability from the
+/// synchronous `reserve_and_dispatch` call path.
+static COUNTER: Mutex<Option<Counter>> = Mutex::new(None);
+
+/// Spawns the long-lived save worker thread and stores its job sender in
+/// `SAVE_TX`, following the `hotkeys::init()` guard convention. The
+/// returned `Sender` is bound to a kept-alive local in `main.rs` (`_saver`)
+/// for symmetry with `_tray`/`_hotkeys`, even though the worker thread's
+/// lifetime is independent of it.
+///
+/// # Panics
+/// Panics if called more than once.
+pub fn init() -> Sender<SaveJob> {
+    let (tx, rx) = mpsc::channel::<SaveJob>();
+
+    std::thread::spawn(move || {
+        while let Ok(job) = rx.recv() {
+            worker_process(job);
+        }
+    });
+
+    SAVE_TX
+        .set(tx.clone())
+        .unwrap_or_else(|_| panic!("save::init() called more than once"));
+
+    tx
+}
+
+/// Runs on the worker thread: encodes + writes one job, then posts
+/// `WM_APP_SAVE_DONE` back to the UI thread. `wparam` carries no pointer and
+/// no meaning (T-01-12/T-02-13 rule) -- the outcome itself travels through
+/// `SAVE_RESULTS`, a process-internal queue only our own wnd_proc drains.
+fn worker_process(job: SaveJob) {
+    let final_path = job.final_path.clone();
+    let advisory = job.advisory.clone();
+
+    let outcome = match encode_and_write(job) {
+        Ok(file_name) => SaveOutcome {
+            file_name,
+            path: final_path,
+            error: None,
+            advisory,
+        },
+        Err(e) => {
+            let file_name = final_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            SaveOutcome {
+                file_name,
+                path: final_path,
+                error: Some(e),
+                advisory,
+            }
+        }
+    };
+
+    SAVE_RESULTS.lock().unwrap().push_back(outcome);
+    unsafe {
+        let _ = PostMessageW(
+            Some(app::main_hwnd()),
+            constants::WM_APP_SAVE_DONE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Encodes `job.bitmap` into `job.format` and writes it atomically:
+/// encode into memory, write to a `.tmp` file, then `std::fs::rename` to the
+/// final path. Uses plain `std::fs::rename` -- never `MoveFileExW` with a
+/// replace-existing flag, because Windows' `rename` already refuses an
+/// existing destination, which is exactly SAVE-02's never-overwrite
+/// guarantee for free. On any failure, the tmp file is deleted best-effort
+/// and the `std::io::Error` Display string is returned verbatim (ERR-02).
+fn encode_and_write(job: SaveJob) -> Result<String, String> {
+    let SaveJob {
+        bitmap,
+        final_path,
+        format,
+        jpg_quality,
+        ..
+    } = job;
+
+    let width = bitmap.width as u32;
+    let height = bitmap.height as u32;
+
+    // BGRA -> RGBA channel swap (bytes 0 and 2 of every 4-byte pixel) --
+    // this MUST happen before any `image` encoder call. This is the single
+    // most likely correctness bug in the phase (RESEARCH.md assumption A3).
+    let mut rgba = bitmap.bgra;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let encode_result: image::ImageResult<()> = match format {
+        Format::Png => {
+            // D-10: CompressionType::Fast, never Best/zopfli -- the 100 ms
+            // budget depends on it.
+            let encoder =
+                PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
+            encoder.write_image(&rgba, width, height, ExtendedColorType::Rgba8)
+        }
+        Format::Jpg => {
+            // JPEG has no alpha channel -- convert to RGB8 first.
+            let rgb: Vec<u8> = rgba
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            let encoder = JpegEncoder::new_with_quality(&mut buf, jpg_quality);
+            encoder.write_image(&rgb, width, height, ExtendedColorType::Rgb8)
+        }
+        Format::Bmp => {
+            let encoder = BmpEncoder::new(&mut buf);
+            encoder.write_image(&rgba, width, height, ExtendedColorType::Rgba8)
+        }
+        Format::Webp => {
+            // SAVE-06 requires lossless only -- the only constructor the
+            // crate offers anyway.
+            let encoder = WebPEncoder::new_lossless(&mut buf);
+            encoder.write_image(&rgba, width, height, ExtendedColorType::Rgba8)
+        }
+    };
+    encode_result.map_err(|e| e.to_string())?;
+
+    let final_file_name = final_path
+        .file_name()
+        .ok_or_else(|| "final path has no file name".to_string())?
+        .to_string_lossy()
+        .into_owned();
+    let tmp_file_name = tmp_name_for(&final_file_name);
+    let tmp_path = final_path
+        .parent()
+        .map(|p| p.join(&tmp_file_name))
+        .ok_or_else(|| "final path has no parent directory".to_string())?;
+
+    if let Err(e) = std::fs::write(&tmp_path, &buf) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.to_string());
+    }
+
+    Ok(final_file_name)
+}
+
+/// Drains the oldest pending `SaveOutcome`, if any, for the wnd_proc arm
+/// (plan 02-04) to toast/report.
+pub fn take_result() -> Option<SaveOutcome> {
+    SAVE_RESULTS.lock().unwrap().pop_front()
+}
+
+/// Runs on the UI thread: resolves the save folder, reserves the next
+/// filename number synchronously (SAVE-03 -- this MUST complete before this
+/// function returns, so a second hotkey press can never compute the same
+/// number), then hands the job to the worker thread. `advisory` (D-22's
+/// multi-monitor text) is carried through into the eventual `SaveOutcome` so
+/// it can be appended to the success toast.
+pub fn reserve_and_dispatch(
+    bitmap: RawBitmap,
+    cfg: &Config,
+    advisory: Option<String>,
+) -> Result<(), String> {
+    let dir = config::resolve_save_folder(cfg);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let base = config::sanitize_base_filename(&cfg.base_filename);
+    let format = Format::from_str(&cfg.format);
+    let ext = format.ext();
+
+    let n = {
+        let mut guard = COUNTER.lock().unwrap();
+        let counter = guard.get_or_insert_with(Counter::default);
+        counter.set_target(&dir, &base);
+        counter.next(ext)
+    };
+
+    let final_path = dir.join(filename_for(&base, n, ext));
+
+    let job = SaveJob {
+        bitmap,
+        final_path,
+        format,
+        jpg_quality: cfg.jpg_quality,
+        advisory,
+    };
+
+    let tx = SAVE_TX
+        .get()
+        .ok_or_else(|| "save worker not initialized".to_string())?;
+    tx.send(job)
+        .map_err(|_| "save worker channel closed".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +503,39 @@ mod tests {
         assert!(!dir.join("corvus999.png.tmp").exists());
         assert!(dir.join("notes.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Proves the BGRA -> RGBA swap in `encode_and_write`: a synthetic 2x2
+    /// bitmap whose top-left pixel is BGRA-order pure red (`(0, 0, 255,
+    /// 255)`) must decode back out of the PNG as RGB red (`(255, 0, 0)`),
+    /// not blue -- catching exactly the color-swap bug RESEARCH.md flags as
+    /// the phase's most likely correctness defect.
+    #[test]
+    fn png_roundtrip_proves_bgra_to_rgba_swap() {
+        use image::GenericImageView;
+
+        // Top-left pixel BGRA(0, 0, 255, 255) = pure red once swapped to RGBA.
+        let bgra = vec![
+            0, 0, 255, 255, // top-left: B=0 G=0 R=255 A=255
+            0, 255, 0, 255, // top-right: green
+            255, 0, 0, 255, // bottom-left: blue
+            255, 255, 255, 255, // bottom-right: white
+        ];
+
+        let mut rgba = bgra.clone();
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+
+        let mut buf = Vec::new();
+        let encoder =
+            PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
+        encoder
+            .write_image(&rgba, 2, 2, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let decoded = image::load_from_memory(&buf).unwrap();
+        let top_left = decoded.get_pixel(0, 0);
+        assert_eq!(top_left.0, [255, 0, 0, 255], "expected red, got {:?} -- BGRA/RGBA swap missing or wrong", top_left.0);
     }
 }

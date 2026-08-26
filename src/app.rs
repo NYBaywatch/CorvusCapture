@@ -23,6 +23,95 @@ use crate::hotkeys;
 use crate::singleinstance;
 use crate::toast;
 use crate::tray;
+use crate::{capture, clipboard, config, save};
+
+/// Which hotkey triggered `run_capture` -- keeps the two dispatch arms thin
+/// routers into one shared pipeline (PATTERNS.md guidance).
+enum CaptureSource {
+    Fullscreen,
+    ActiveWindow,
+}
+
+/// The locked capture pipeline order (CAP-01/CAP-03/CAP-05, D-11/D-16/D-18/
+/// D-20/D-22, ERR-01): re-read config -> resolve geometry -> capture ->
+/// build advisory -> optional clipboard copy -> hand off to the save worker.
+/// Every branch either ends in a saved file or a toast -- never a silent
+/// no-op (D-18/ERR-02) -- and never shows any window/dialog (CAP-01/CAP-05).
+fn run_capture(source: CaptureSource) {
+    let cfg = config::load();
+
+    let (bitmap, advisory) = match source {
+        CaptureSource::Fullscreen => {
+            let rect = match capture::monitor_under_cursor() {
+                Ok(r) => r,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            let bitmap = match capture::grab(rect) {
+                Ok(b) => b,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            (bitmap, None)
+        }
+        CaptureSource::ActiveWindow => {
+            let target = match capture::active_window_target() {
+                Ok(t) => t,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            let target = match target {
+                capture::ActiveWindowTarget::None => {
+                    // D-20: no fullscreen fallback -- nothing is saved.
+                    toast::show("No active window to capture");
+                    return;
+                }
+                t @ capture::ActiveWindowTarget::Window { .. } => t,
+            };
+            let rect = match &target {
+                capture::ActiveWindowTarget::Window { rect, .. } => *rect,
+                capture::ActiveWindowTarget::None => unreachable!(),
+            };
+            let bitmap = match capture::grab_window(&target) {
+                Ok(b) => b,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            // D-22: the "two monitors" wording stays literal even for 3+.
+            let advisory = if capture::monitor_span_count(rect) > 1 {
+                Some(
+                    "window spanned two monitors; scaling may look mixed. \
+                     Tip: capture on a single monitor for best results."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            (bitmap, advisory)
+        }
+    };
+
+    // D-16: clipboard copy happens before the bitmap moves into the save
+    // job, and failure is non-fatal -- the file save proceeds regardless.
+    if cfg.clipboard_enabled {
+        let _ = clipboard::copy_dib(&bitmap);
+    }
+
+    // ERR-01/D-17: a folder-creation failure routes through the existing
+    // Settings dispatch seam -- zero new plumbing.
+    if save::reserve_and_dispatch(bitmap, &cfg, advisory).is_err() {
+        toast::show("Can't create save folder — opening Settings");
+        dispatch(AppAction::OpenSettings);
+    }
+}
 
 /// Actions the app can perform. Phase 1 wires the routing seams; Phases
 /// 2-4 fill in the real behavior behind each variant.
@@ -143,13 +232,12 @@ pub fn dispatch(action: AppAction) {
         }
         AppAction::ShowAbout => about::show(),
         // Phase 2: F9 fullscreen capture of the monitor under the cursor.
-        // D-07 stub proves the pump -> hotkey -> UI path end to end.
         AppAction::CaptureFullscreen => {
-            toast::show("F9 — fullscreen capture (coming soon)");
+            run_capture(CaptureSource::Fullscreen);
         }
         // Phase 2: Ctrl+F9 capture of the active (focused) window.
         AppAction::CaptureActiveWindow => {
-            toast::show("Ctrl+F9 — active window capture (coming soon)");
+            run_capture(CaptureSource::ActiveWindow);
         }
         // Phase 3: Shift+F9 frozen-overlay region capture.
         AppAction::CaptureRegion => {

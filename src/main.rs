@@ -9,6 +9,7 @@ mod clipboard;
 mod config;
 mod constants;
 mod hotkeys;
+mod save;
 mod singleinstance;
 mod toast;
 mod tray;
@@ -123,6 +124,20 @@ fn main() {
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
     let _tray = tray::init().expect("failed to create tray icon");
+
+    // Phase 2 startup: the orphan `.tmp` sweep must finish and the save
+    // worker thread must exist before hotkeys are registered -- hotkey
+    // registration is the last gate before a capture can fire, and D-19
+    // requires no stale `.tmp` file to be visible to the very first
+    // capture. This config load is for the sweep only -- D-11 requires
+    // config to be re-read on every capture press, so `app::dispatch` must
+    // not reuse this snapshot.
+    let cfg = config::load();
+    save::sweep_orphan_tmp(
+        &config::resolve_save_folder(&cfg),
+        &config::sanitize_base_filename(&cfg.base_filename),
+    );
+    let _saver = save::init();
 
     // Registered strictly after the window and tray exist (RESEARCH.md
     // Pitfall 2). Kept alive for the process lifetime -- dropping it

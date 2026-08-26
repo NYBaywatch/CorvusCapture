@@ -23,6 +23,124 @@ use crate::hotkeys;
 use crate::singleinstance;
 use crate::toast;
 use crate::tray;
+use crate::{capture, clipboard, config, save};
+
+/// Which hotkey triggered `run_capture` -- keeps the two dispatch arms thin
+/// routers into one shared pipeline (PATTERNS.md guidance).
+enum CaptureSource {
+    Fullscreen,
+    ActiveWindow,
+}
+
+/// The locked capture pipeline order (CAP-01/CAP-03/CAP-05, D-11/D-16/D-18/
+/// D-20/D-22, ERR-01): re-read config -> resolve geometry -> capture ->
+/// build advisory -> optional clipboard copy -> hand off to the save worker.
+/// Every branch either ends in a saved file or a toast -- never a silent
+/// no-op (D-18/ERR-02) -- and never shows any window/dialog (CAP-01/CAP-05).
+fn run_capture(source: CaptureSource) {
+    let cfg = config::load();
+
+    let (bitmap, advisory) = match source {
+        CaptureSource::Fullscreen => {
+            let rect = match capture::monitor_under_cursor() {
+                Ok(r) => r,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            let bitmap = match capture::grab(rect) {
+                Ok(b) => b,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            (bitmap, None)
+        }
+        CaptureSource::ActiveWindow => {
+            let target = match capture::active_window_target() {
+                Ok(t) => t,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            let target = match target {
+                capture::ActiveWindowTarget::None => {
+                    // D-20: no fullscreen fallback -- nothing is saved.
+                    toast::show("No active window to capture");
+                    return;
+                }
+                t @ capture::ActiveWindowTarget::Window { .. } => t,
+            };
+            let rect = match &target {
+                capture::ActiveWindowTarget::Window { rect, .. } => *rect,
+                capture::ActiveWindowTarget::None => unreachable!(),
+            };
+            let bitmap = match capture::grab_window(&target) {
+                Ok(b) => b,
+                Err(e) => {
+                    toast::show(&format!("Capture failed — {e}"));
+                    return;
+                }
+            };
+            // D-22: the "two monitors" wording stays literal even for 3+.
+            let advisory = if capture::monitor_span_count(rect) > 1 {
+                Some(
+                    "window spanned two monitors; scaling may look mixed. \
+                     Tip: capture on a single monitor for best results."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            (bitmap, advisory)
+        }
+    };
+
+    // D-16: clipboard copy happens before the bitmap moves into the save
+    // job, and failure is non-fatal -- the file save proceeds regardless.
+    if cfg.clipboard_enabled {
+        let _ = clipboard::copy_dib(&bitmap);
+    }
+
+    // ERR-01/D-17: a folder-creation failure routes through the existing
+    // Settings dispatch seam -- zero new plumbing.
+    if save::reserve_and_dispatch(bitmap, &cfg, advisory).is_err() {
+        toast::show("Can't create save folder — opening Settings");
+        dispatch(AppAction::OpenSettings);
+    }
+}
+
+/// Reports one completed save job's outcome via the locked copy contract.
+/// Failures ALWAYS toast, independent of `toast_enabled` -- UI-SPEC's locked
+/// reconciliation of D-12 and D-18 is that the toggle suppresses save
+/// confirmations only; failures are never silent (ERR-02).
+fn handle_save_outcome(outcome: save::SaveOutcome) {
+    if let Some(msg) = &outcome.error {
+        toast::show(&format!("Save failed — {msg}"));
+        return;
+    }
+
+    // Re-read config here (D-11) rather than caching a snapshot from the
+    // capture that triggered this save.
+    let cfg = config::load();
+    if !cfg.toast_enabled {
+        return;
+    }
+
+    let mut text = format!("Saved {}", outcome.file_name);
+    if let Some(advisory) = &outcome.advisory {
+        text.push_str(&format!(" — {advisory}"));
+    }
+
+    toast::show_for_file(
+        &text,
+        &outcome.path,
+        config::ClickAction::from_str(&cfg.toast_click_action),
+    );
+}
 
 /// Actions the app can perform. Phase 1 wires the routing seams; Phases
 /// 2-4 fill in the real behavior behind each variant.
@@ -143,13 +261,12 @@ pub fn dispatch(action: AppAction) {
         }
         AppAction::ShowAbout => about::show(),
         // Phase 2: F9 fullscreen capture of the monitor under the cursor.
-        // D-07 stub proves the pump -> hotkey -> UI path end to end.
         AppAction::CaptureFullscreen => {
-            toast::show("F9 — fullscreen capture (coming soon)");
+            run_capture(CaptureSource::Fullscreen);
         }
         // Phase 2: Ctrl+F9 capture of the active (focused) window.
         AppAction::CaptureActiveWindow => {
-            toast::show("Ctrl+F9 — active window capture (coming soon)");
+            run_capture(CaptureSource::ActiveWindow);
         }
         // Phase 3: Shift+F9 frozen-overlay region capture.
         AppAction::CaptureRegion => {
@@ -161,9 +278,10 @@ pub fn dispatch(action: AppAction) {
 /// Window procedure for the hidden hub window. Routes `WM_APP_*` messages
 /// to `dispatch`; everything else falls through to `DefWindowProcW`.
 ///
-/// T-01-04 mitigation: only the three known `WM_APP_*` ids are handled,
-/// each arm treats wparam as an opaque id validated before dispatch, and
-/// no arm dereferences a caller-supplied pointer in Phase 1.
+/// T-01-04 mitigation: four `WM_APP_*` ids are now handled, each arm treats
+/// wparam as an opaque id validated before dispatch (or, for the save-done
+/// arm, ignores wparam entirely), and no arm dereferences a caller-supplied
+/// pointer.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -206,6 +324,15 @@ unsafe extern "system" fn wnd_proc(
             // TRAY-03: left-click opens (the seam for) Settings.
             if wparam.0 == tray::TRAY_INDEX_LEFT_CLICK {
                 dispatch(AppAction::OpenSettings);
+            }
+            LRESULT(0)
+        }
+        m if m == constants::WM_APP_SAVE_DONE => {
+            // T-02-16: wparam/lparam carry no meaning -- the outcome itself
+            // travels through save's own process-internal result queue, so
+            // a forged message with an empty queue is a no-op.
+            while let Some(outcome) = save::take_result() {
+                handle_save_outcome(outcome);
             }
             LRESULT(0)
         }

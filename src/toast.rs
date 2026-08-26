@@ -8,6 +8,7 @@
 //! instead of stacking a second window on screen.
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{PCWSTR, Result};
@@ -19,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
     RegisterClassW, SetLayeredWindowAttributes, SetTimer, ShowWindow, SystemParametersInfoW,
@@ -27,7 +29,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::config::ClickAction;
 use crate::constants;
+
+/// D-14: what clicking the currently-shown toast should do. Only
+/// `show_for_file` sets this (for save-confirmation toasts); plain `show`
+/// always clears it first, so an error or advisory toast that replaces a
+/// save toast never inherits the previous file's click target (UI-SPEC:
+/// "Click on error/advisory toast -- always plain dismiss").
+struct ClickTarget {
+    path: PathBuf,
+    action: ClickAction,
+}
 
 /// Process-global handle to the currently-shown toast, if any. Cleared by
 /// `wnd_proc` on `WM_DESTROY` so the next `show` call recreates the window.
@@ -35,6 +48,9 @@ static TOAST_HWND: Mutex<Option<isize>> = Mutex::new(None);
 
 /// Text rendered by the toast's `WM_PAINT` handler.
 static TOAST_TEXT: Mutex<String> = Mutex::new(String::new());
+
+/// D-14 click target for the currently-shown toast, if any.
+static TOAST_CLICK: Mutex<Option<ClickTarget>> = Mutex::new(None);
 
 /// Guards one-time registration of the toast window class.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -45,6 +61,10 @@ static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 pub fn show(text: &str) {
     register_class_once();
     *TOAST_TEXT.lock().unwrap() = text.to_string();
+    // D-14: a plain `show` (error/advisory/other) never carries a click
+    // target -- clear any target left behind by a prior `show_for_file` so
+    // clicking this toast is always a plain dismiss.
+    *TOAST_CLICK.lock().unwrap() = None;
 
     let existing = *TOAST_HWND.lock().unwrap();
     if let Some(raw) = existing {
@@ -74,6 +94,20 @@ pub fn show(text: &str) {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
     }
+}
+
+/// Shows (or updates) a save-confirmation toast with a D-14 click target:
+/// clicking it opens or reveals `path` per `action` instead of a plain
+/// dismiss. Sets `TOAST_CLICK` before delegating to `show`'s body so the
+/// replace-and-reset (D-15) behavior is identical to a plain toast.
+pub fn show_for_file(text: &str, path: &Path, action: ClickAction) {
+    // `show` clears TOAST_CLICK unconditionally, so the click target must be
+    // set AFTER delegating to it, not before.
+    show(text);
+    *TOAST_CLICK.lock().unwrap() = Some(ClickTarget {
+        path: path.to_path_buf(),
+        action,
+    });
 }
 
 /// Dev-only: pumps messages until the currently-shown toast is destroyed.
@@ -132,6 +166,46 @@ fn create_toast_window() -> Option<HWND> {
         )
     };
     result.ok()
+}
+
+/// D-14 `open_file`: opens `path` with its default associated app, mirroring
+/// `app.rs`'s `OpenCaptureFolder` `ShellExecuteW` call shape (verb `"open"`,
+/// `SW_SHOWNORMAL`). Each wide-string buffer is bound to a local so it
+/// outlives the call.
+fn open_file(path: &Path) {
+    let path_str = path.to_string_lossy();
+    let path_wide = constants::to_wide(&path_str);
+    let verb = constants::to_wide("open");
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(path_wide.as_ptr()),
+            PCWSTR(std::ptr::null()),
+            PCWSTR(std::ptr::null()),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// D-14 `reveal_explorer`: opens Explorer with `path` selected via
+/// `explorer.exe /select,"{path}"`.
+fn reveal_in_explorer(path: &Path) {
+    let path_str = path.to_string_lossy();
+    let params = format!("/select,\"{path_str}\"");
+    let params_wide = constants::to_wide(&params);
+    let target = constants::to_wide("explorer.exe");
+    let verb = constants::to_wide("open");
+    unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR(params_wide.as_ptr()),
+            PCWSTR(std::ptr::null()),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
 }
 
 fn get_work_area() -> RECT {
@@ -213,6 +287,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            // D-14: take (not just read) the click target so a stale target
+            // can never be reused by a later click on the recreated window.
+            if let Some(target) = TOAST_CLICK.lock().unwrap().take() {
+                match target.action {
+                    ClickAction::OpenFile => open_file(&target.path),
+                    ClickAction::RevealExplorer => reveal_in_explorer(&target.path),
+                    ClickAction::Dismiss => {}
+                }
+            }
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
@@ -220,6 +303,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_DESTROY => {
             *TOAST_HWND.lock().unwrap() = None;
+            *TOAST_CLICK.lock().unwrap() = None;
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

@@ -5,6 +5,7 @@
 mod about;
 mod app;
 mod capture;
+mod clipboard;
 mod config;
 mod constants;
 mod hotkeys;
@@ -44,6 +45,48 @@ fn verify_dpi_and_exit() -> ! {
     std::process::exit(if active { 0 } else { 2 });
 }
 
+/// Dev-only: exercises the whole capture -> clipboard path (grab the
+/// monitor under the cursor, verify the buffer shape, copy it as CF_DIB) and
+/// exits with a process code, since the binary is a GUI-subsystem app with
+/// no console. `OutputDebugStringW` carries the human-readable result.
+fn capture_selftest_and_exit() -> ! {
+    let _hwnd = app::create_main_window().expect("failed to create main window");
+
+    let outcome: Result<(i32, i32), String> = (|| {
+        let rect = capture::monitor_under_cursor().map_err(|e| e.to_string())?;
+        let bitmap = capture::grab(rect).map_err(|e| e.to_string())?;
+
+        let expected_len = (bitmap.width as usize) * (bitmap.height as usize) * 4;
+        if bitmap.width <= 0 || bitmap.height <= 0 || bitmap.bgra.len() != expected_len {
+            return Err(format!(
+                "buffer-length assertion failed: {}x{} -> {} bytes (expected {})",
+                bitmap.width,
+                bitmap.height,
+                bitmap.bgra.len(),
+                expected_len
+            ));
+        }
+
+        clipboard::copy_dib(&bitmap).map_err(|e| e.to_string())?;
+
+        Ok((bitmap.width, bitmap.height))
+    })();
+
+    let (message, code) = match outcome {
+        Ok((width, height)) => (
+            format!("Corvus Capture: --capture-selftest PASSED ({width}x{height})\0"),
+            0,
+        ),
+        Err(e) => (
+            format!("Corvus Capture: --capture-selftest FAILED: {e}\0"),
+            3,
+        ),
+    };
+    let wide: Vec<u16> = message.encode_utf16().collect();
+    unsafe { OutputDebugStringW(windows::core::PCWSTR(wide.as_ptr())) };
+    std::process::exit(code);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -67,6 +110,15 @@ fn main() {
         toast::show(&text);
         toast::run_until_dismissed();
         std::process::exit(0);
+    }
+
+    // Hidden dev affordance: `--capture-selftest [out_path]` proves the
+    // whole grab -> clipboard path from the command line, with no hotkey
+    // involved. Not a shipped feature -- exists purely to make Phase 2
+    // implementation and CI verifiable without pressing F9. Runs before any
+    // tray/hotkey init so it never registers a hotkey.
+    if args.iter().any(|a| a == "--capture-selftest") {
+        capture_selftest_and_exit();
     }
 
     let _hwnd = app::create_main_window().expect("failed to create main window");

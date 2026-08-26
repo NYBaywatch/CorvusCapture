@@ -113,6 +113,35 @@ fn run_capture(source: CaptureSource) {
     }
 }
 
+/// Reports one completed save job's outcome via the locked copy contract.
+/// Failures ALWAYS toast, independent of `toast_enabled` -- UI-SPEC's locked
+/// reconciliation of D-12 and D-18 is that the toggle suppresses save
+/// confirmations only; failures are never silent (ERR-02).
+fn handle_save_outcome(outcome: save::SaveOutcome) {
+    if let Some(msg) = &outcome.error {
+        toast::show(&format!("Save failed — {msg}"));
+        return;
+    }
+
+    // Re-read config here (D-11) rather than caching a snapshot from the
+    // capture that triggered this save.
+    let cfg = config::load();
+    if !cfg.toast_enabled {
+        return;
+    }
+
+    let mut text = format!("Saved {}", outcome.file_name);
+    if let Some(advisory) = &outcome.advisory {
+        text.push_str(&format!(" — {advisory}"));
+    }
+
+    toast::show_for_file(
+        &text,
+        &outcome.path,
+        config::ClickAction::from_str(&cfg.toast_click_action),
+    );
+}
+
 /// Actions the app can perform. Phase 1 wires the routing seams; Phases
 /// 2-4 fill in the real behavior behind each variant.
 pub enum AppAction {
@@ -249,9 +278,10 @@ pub fn dispatch(action: AppAction) {
 /// Window procedure for the hidden hub window. Routes `WM_APP_*` messages
 /// to `dispatch`; everything else falls through to `DefWindowProcW`.
 ///
-/// T-01-04 mitigation: only the three known `WM_APP_*` ids are handled,
-/// each arm treats wparam as an opaque id validated before dispatch, and
-/// no arm dereferences a caller-supplied pointer in Phase 1.
+/// T-01-04 mitigation: four `WM_APP_*` ids are now handled, each arm treats
+/// wparam as an opaque id validated before dispatch (or, for the save-done
+/// arm, ignores wparam entirely), and no arm dereferences a caller-supplied
+/// pointer.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -294,6 +324,15 @@ unsafe extern "system" fn wnd_proc(
             // TRAY-03: left-click opens (the seam for) Settings.
             if wparam.0 == tray::TRAY_INDEX_LEFT_CLICK {
                 dispatch(AppAction::OpenSettings);
+            }
+            LRESULT(0)
+        }
+        m if m == constants::WM_APP_SAVE_DONE => {
+            // T-02-16: wparam/lparam carry no meaning -- the outcome itself
+            // travels through save's own process-internal result queue, so
+            // a forged message with an empty queue is a no-op.
+            while let Some(outcome) = save::take_result() {
+                handle_save_outcome(outcome);
             }
             LRESULT(0)
         }

@@ -4,6 +4,7 @@
 
 mod about;
 mod app;
+mod capture;
 mod config;
 mod constants;
 mod hotkeys;

@@ -1,7 +1,10 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+// `cargo test` needs a console test harness with visible output; release
+// builds stay windowless (see attribute above).
 
 mod about;
 mod app;
+mod config;
 mod constants;
 mod hotkeys;
 mod singleinstance;

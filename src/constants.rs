@@ -50,6 +50,9 @@ pub const WM_APP_MENU: u32 = WM_APP + 2;
 /// Posted for tray icon events (e.g. left-click).
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
 
+/// Posted by the save worker thread when an encode+write job finishes.
+pub const WM_APP_SAVE_DONE: u32 = WM_APP + 4;
+
 // ---------------------------------------------------------------------
 // Toast tuning (consumed by plan 01-03)
 // ---------------------------------------------------------------------
@@ -82,6 +85,29 @@ pub fn default_capture_dir() -> std::path::PathBuf {
         .join("Pictures")
         .join("CorvusCapture")
 }
+
+// ---------------------------------------------------------------------
+// Config store (D-11/D-13)
+// ---------------------------------------------------------------------
+
+/// App-data subfolder name; resolves to `%APPDATA%\CorvusCapture\`.
+pub const APP_DATA_DIR_NAME: &str = "CorvusCapture";
+
+/// Config file name within `APP_DATA_DIR_NAME`, per SET-03/D-11.
+pub const CONFIG_FILE_NAME: &str = "config.json";
+
+// ---------------------------------------------------------------------
+// Save pipeline
+// ---------------------------------------------------------------------
+
+/// Appended to the FULL final filename (e.g. `corvus004.png.tmp`) via
+/// string concatenation -- never via `Path::with_extension`, which would
+/// silently replace the real extension instead of appending to it.
+pub const TMP_SUFFIX: &str = ".tmp";
+
+/// Extensions this app writes; used by the D-19 orphan `.tmp` sweep to
+/// match only our own files, never an unrelated process's temp file.
+pub const CAPTURE_EXTENSIONS: [&str; 4] = ["png", "jpg", "bmp", "webp"];
 
 // ---------------------------------------------------------------------
 // Helpers

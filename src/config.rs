@@ -172,14 +172,15 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     std::fs::write(&path, text)
 }
 
-/// Strips every character in `\ / : * ? " < > |` plus all `.` characters
-/// (which also kills `..` traversal and stray extensions), trims ASCII
-/// whitespace, and falls back to `"corvus"` if the result is empty
-/// (T-02-01, ASVS V5).
+/// Strips every character in `\ / : * ? " < > |`, all control characters
+/// (0x00-0x1F are invalid in Windows filenames and trivially expressible
+/// via JSON string escapes), plus all `.` characters (which also kills
+/// `..` traversal and stray extensions), trims ASCII whitespace, and falls
+/// back to `"corvus"` if the result is empty (T-02-01, ASVS V5).
 pub fn sanitize_base_filename(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .filter(|c| !INVALID_FILENAME_CHARS.contains(c) && *c != '.')
+        .filter(|c| !INVALID_FILENAME_CHARS.contains(c) && *c != '.' && !c.is_control())
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
@@ -236,6 +237,16 @@ mod tests {
         for c in INVALID_FILENAME_CHARS {
             assert!(!result.contains(*c));
         }
+    }
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        // JSON string escapes make embedded control chars trivial to
+        // express in a hand-edited config.json (WR-06).
+        assert_eq!(sanitize_base_filename("cor\u{0}vus\u{1f}"), "corvus");
+        assert_eq!(sanitize_base_filename("shot\nname\tx"), "shotnamex");
+        // All-control input falls back to the default.
+        assert_eq!(sanitize_base_filename("\u{1}\u{2}\u{3}"), "corvus");
     }
 
     #[test]

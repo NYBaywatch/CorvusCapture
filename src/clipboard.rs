@@ -44,9 +44,11 @@ pub fn copy_dib(bitmap: &RawBitmap) -> windows::core::Result<()> {
     let mut header = BITMAPINFOHEADER {
         biSize: header_len as u32,
         biWidth: bitmap.width,
-        // Negative => top-down, matching the capture buffer's own layout
-        // (RawBitmap's doc comment) so no row-flip is needed here.
-        biHeight: -bitmap.height,
+        // Positive => bottom-up, the long-standing CF_DIB convention. Some
+        // paste targets (older Office, Java/AWT consumers) mishandle
+        // top-down (negative-height) clipboard DIBs, so the capture
+        // buffer's top-down rows are flipped below (WR-05).
+        biHeight: bitmap.height,
         biPlanes: 1,
         biBitCount: 32,
         biCompression: BI_RGB.0,
@@ -57,11 +59,16 @@ pub fn copy_dib(bitmap: &RawBitmap) -> windows::core::Result<()> {
 
     unsafe {
         std::ptr::copy_nonoverlapping(header_ptr, ptr as *mut u8, header_len);
-        std::ptr::copy_nonoverlapping(
-            bitmap.bgra.as_ptr(),
-            (ptr as *mut u8).add(header_len),
-            pixel_len,
-        );
+        // Copy rows in reverse order: the capture buffer is top-down, the
+        // clipboard DIB is bottom-up. 32bpp rows are DWORD-aligned by
+        // construction, so the stride is exactly width * 4 with no padding.
+        let stride = bitmap.width as usize * 4;
+        let height = bitmap.height as usize;
+        let dst = (ptr as *mut u8).add(header_len);
+        for row in 0..height {
+            let src_row = bitmap.bgra.as_ptr().add((height - 1 - row) * stride);
+            std::ptr::copy_nonoverlapping(src_row, dst.add(row * stride), stride);
+        }
         // GlobalUnlock reports an error once the object's lock count drops
         // to zero even on a normal successful unlock (Win32 convention:
         // FALSE + NO_ERROR) -- this is not a real failure and is

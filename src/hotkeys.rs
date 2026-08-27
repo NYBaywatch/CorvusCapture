@@ -111,17 +111,19 @@ pub fn init() -> Result<GlobalHotKeyManager, Box<dyn std::error::Error>> {
     }
 
     GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
-        // Only the key-pressed edge fires a capture/action -- ignore the
-        // release event so a single tap fires exactly once.
-        if event.state() != HotKeyState::Pressed {
-            return;
-        }
+        // Both edges are posted; lparam distinguishes them (0 = pressed,
+        // 1 = released). Only the pressed edge fires a capture/action --
+        // the release edge exists solely so the overlay's Shift+F9
+        // autorepeat guard has a real observation point to clear itself
+        // (CR-05: with releases dropped, `awaiting_release` could never
+        // clear and the D-35 toggle was dead).
+        let released = event.state() == HotKeyState::Released;
         unsafe {
             let _ = PostMessageW(
                 Some(crate::app::main_hwnd()),
                 constants::WM_APP_HOTKEY,
                 WPARAM(event.id() as usize),
-                LPARAM(0),
+                LPARAM(released as isize),
             );
         }
     }));

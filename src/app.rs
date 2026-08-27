@@ -319,9 +319,19 @@ unsafe extern "system" fn wnd_proc(
         m if m == constants::WM_APP_HOTKEY => {
             // wparam is the fired hotkey's runtime id, validated against
             // the registered-hotkey map before dispatch (T-01-17); unknown
-            // ids are ignored rather than treated as a panic.
+            // ids are ignored rather than treated as a panic. lparam
+            // carries the edge: 0 = pressed, non-zero = released.
             if let Some((_label, action_kind)) = hotkeys::lookup(wparam.0 as u32) {
-                dispatch(action_kind.to_action());
+                if lparam.0 != 0 {
+                    // Release edge: only the region hotkey's release carries
+                    // meaning -- it clears the overlay's Shift+F9 autorepeat
+                    // guard (CR-05). Every other release is a no-op.
+                    if matches!(action_kind, hotkeys::ActionKind::CaptureRegion) {
+                        overlay::note_hotkey_released();
+                    }
+                } else {
+                    dispatch(action_kind.to_action());
+                }
             }
             LRESULT(0)
         }

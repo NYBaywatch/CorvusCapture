@@ -32,8 +32,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_DOWN,
-    VK_ESCAPE, VK_F9, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
@@ -842,15 +842,15 @@ pub fn hotkey_toggle() {
 
     let awaiting = with_state(|d| d.awaiting_release).unwrap_or(false);
     if awaiting {
-        // The opening press may still be physically down, autorepeating
-        // WM_HOTKEY -- ignore this event until it is observed up. A genuine
-        // re-press necessarily has a release in between, so D-35's toggle
-        // semantics are preserved exactly.
-        let f9_down = unsafe { GetAsyncKeyState(VK_F9.0 as i32) } < 0;
-        if f9_down {
-            return;
-        }
-        with_state(|d| d.awaiting_release = false);
+        // The opening press is still physically down (this event is
+        // autorepeat) -- swallow it. The guard is cleared by
+        // `note_hotkey_released()` when the hotkey's release edge arrives
+        // via app.rs, so a genuine re-press (which necessarily has a
+        // release in between) toggles as D-35 specifies. Polling
+        // GetAsyncKeyState here was useless: pressed-edge events are
+        // processed milliseconds after the physical press, so F9 was
+        // virtually always still down and the flag never cleared (CR-05).
+        return;
     }
 
     let has_sel = with_state(|d| d.sel.is_some()).unwrap_or(false);
@@ -859,6 +859,16 @@ pub fn hotkey_toggle() {
     } else {
         cancel(hwnd);
     }
+}
+
+/// Clears the D-35 autorepeat guard: called by `app.rs` when the region
+/// hotkey's *release* edge arrives (posted by `hotkeys.rs` with a non-zero
+/// lparam). This is the guard's only observation point for "the opening
+/// press is physically up" -- pressed-edge events always arrive while the
+/// key is down, so polling key state inside `hotkey_toggle` could never
+/// clear the flag (CR-05). No-op if no overlay is open.
+pub fn note_hotkey_released() {
+    with_state(|d| d.awaiting_release = false);
 }
 
 // ---------------------------------------------------------------------

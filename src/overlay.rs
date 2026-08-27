@@ -929,9 +929,6 @@ fn on_mousemove(hwnd: HWND, raw_p: POINT) {
 /// (a bare click that started Outside/Idle, D-31/D-32/REG-06) or settles the
 /// current drag into `Selected`/`Idle`.
 fn on_lbuttonup(hwnd: HWND, raw_p: POINT) {
-    unsafe {
-        let _ = ReleaseCapture();
-    }
     let cx_drag = unsafe { GetSystemMetrics(SM_CXDRAG) };
     let cy_drag = unsafe { GetSystemMetrics(SM_CYDRAG) };
 
@@ -944,15 +941,25 @@ fn on_lbuttonup(hwnd: HWND, raw_p: POINT) {
         let was_click = is_click(d.press_origin, p, cx_drag, cy_drag);
         if should_cancel_on_release(d.press_hit, was_click) {
             should_cancel = true;
-        } else {
-            d.state = if d.sel.is_some() {
-                OverlayState::Selected
-            } else {
-                OverlayState::Idle
-            };
         }
+        // Settle the drag state BEFORE ReleaseCapture below: ReleaseCapture
+        // synchronously sends WM_CAPTURECHANGED to this window even when we
+        // release it ourselves, and on_capturechanged's "capture stolen"
+        // recovery would otherwise revert the selection the user just
+        // dragged (CR-01). With the state already settled, that handler
+        // sees a non-drag state and no-ops.
+        d.state = if d.sel.is_some() {
+            OverlayState::Selected
+        } else {
+            OverlayState::Idle
+        };
         new_sel = d.sel;
     });
+
+    // AFTER the state is settled and the OVERLAY_DATA guard is dropped.
+    unsafe {
+        let _ = ReleaseCapture();
+    }
 
     if should_cancel {
         cancel(hwnd);

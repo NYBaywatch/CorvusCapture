@@ -89,6 +89,42 @@ fn capture_selftest_and_exit() -> ! {
     std::process::exit(code);
 }
 
+/// Dev-only: exercises `overlay::open()` end-to-end and asserts the REG-01
+/// sub-50 ms budget (Phase 3 Plan 02 Task 3). Registers the overlay class,
+/// opens it, reads the timing recorded by `open()`, immediately closes it,
+/// pumps until torn down, then reports PASSED/FAILED with a non-zero exit
+/// code on failure so the check is scriptable. Runs before any tray/hotkey
+/// init, mirroring `capture_selftest_and_exit`'s shape.
+fn overlay_selftest_and_exit() -> ! {
+    let _hwnd = app::create_main_window().expect("failed to create main window");
+
+    overlay::open();
+    let elapsed_ms = overlay::last_open_ms();
+    let dims = overlay::frozen_dims();
+    overlay::close_active();
+    overlay::run_until_closed();
+
+    let (message, code) = match (elapsed_ms, dims) {
+        (Some(ms), Some((w, h))) if ms < 50.0 => (
+            format!("Corvus Capture: --overlay-selftest PASSED ({ms:.1} ms, {w}x{h})\0"),
+            0,
+        ),
+        (Some(ms), Some((w, h))) => (
+            format!(
+                "Corvus Capture: --overlay-selftest FAILED ({ms:.1} ms exceeds 50 ms budget, {w}x{h})\0"
+            ),
+            3,
+        ),
+        _ => (
+            "Corvus Capture: --overlay-selftest FAILED: overlay did not open\0".to_string(),
+            3,
+        ),
+    };
+    let wide: Vec<u16> = message.encode_utf16().collect();
+    unsafe { OutputDebugStringW(windows::core::PCWSTR(wide.as_ptr())) };
+    std::process::exit(code);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -121,6 +157,14 @@ fn main() {
     // tray/hotkey init so it never registers a hotkey.
     if args.iter().any(|a| a == "--capture-selftest") {
         capture_selftest_and_exit();
+    }
+
+    // Hidden dev affordance: `--overlay-selftest` proves the REG-01 <50 ms
+    // overlay-appearance budget from the command line. Not a shipped
+    // feature. Runs before any tray/hotkey init so it never registers a
+    // hotkey and cannot collide with a real Shift+F9 press.
+    if args.iter().any(|a| a == "--overlay-selftest") {
+        overlay_selftest_and_exit();
     }
 
     let _hwnd = app::create_main_window().expect("failed to create main window");

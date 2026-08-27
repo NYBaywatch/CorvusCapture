@@ -381,6 +381,52 @@ pub fn last_open_ms() -> Option<f64> {
     *LAST_OPEN_MS.lock().unwrap()
 }
 
+/// Reads back the frozen bitmap's dimensions for the currently-open
+/// overlay, if any. Used by `--overlay-selftest` (Task 3) so a human can
+/// confirm the overlay covered the whole monitor.
+pub fn frozen_dims() -> Option<(i32, i32)> {
+    with_state(|d| (d.frozen.width, d.frozen.height))
+}
+
+/// Dev-only: closes the currently-open overlay immediately, mirroring the
+/// same single cancel funnel every real cancel/confirm path uses. No-op if
+/// no overlay is open. Used by `--overlay-selftest` (Task 3).
+pub fn close_active() {
+    // The MutexGuard from `.lock()` must be dropped before `cancel()` runs:
+    // `DestroyWindow` delivers `WM_DESTROY` synchronously, which re-locks
+    // `OVERLAY_HWND` to clear it -- holding the guard across that call
+    // (e.g. via `if let Some(raw) = *OVERLAY_HWND.lock().unwrap() { .. }`,
+    // whose temporary lives for the whole `if let` block) deadlocks.
+    let hwnd_raw = *OVERLAY_HWND.lock().unwrap();
+    if let Some(raw) = hwnd_raw {
+        let hwnd = HWND(raw as *mut c_void);
+        cancel(hwnd);
+    }
+}
+
+/// Dev-only: pumps messages until the currently-open overlay has been
+/// destroyed. Used by `--overlay-selftest` (Task 3) so the process can exit
+/// once teardown is complete.
+pub fn run_until_closed() {
+    // `close_active()` calls `DestroyWindow`, which delivers `WM_DESTROY`
+    // synchronously (same thread) before returning -- by the time this runs
+    // the window may already be gone, so check first or `GetMessageW` would
+    // block forever waiting for a message that will never arrive.
+    let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+    unsafe {
+        while is_active()
+            && windows::Win32::UI::WindowsAndMessaging::GetMessageW(&mut msg, None, 0, 0)
+                .as_bool()
+        {
+            let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&msg);
+            windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&msg);
+            if !is_active() {
+                break;
+            }
+        }
+    }
+}
+
 fn register_class_once() {
     CLASS_REGISTERED.get_or_init(|| unsafe {
         let hinstance = GetModuleHandleW(None).expect("GetModuleHandleW failed");

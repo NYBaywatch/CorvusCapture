@@ -22,20 +22,26 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
-    InvalidateRect, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, AC_SRC_OVER,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, FF_DONTCARE, FW_NORMAL, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
-    SRCCOPY, TRANSPARENT,
+    InvalidateRect, Rectangle, RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, NULL_BRUSH, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, RegisterClassW,
-    SetForegroundWindow, ShowWindow, CS_DBLCLKS, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
-    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
+    GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetForegroundWindow, ShowWindow,
+    CS_DBLCLKS, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    SM_CXDRAG, SM_CYDRAG, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, RawBitmap};
@@ -319,6 +325,115 @@ pub fn readout_text(sel: RECT) -> String {
     format!("{w} \u{00D7} {h}")
 }
 
+/// Returns the point on `sel`'s boundary diagonally/perpendicularly opposite
+/// `handle` -- the fixed anchor `resize_rect` drags away from. For the N/S/E/W
+/// edge handles only one axis of the returned point is actually read by
+/// `resize_rect` (the other comes from `original` directly); the unused axis
+/// is filled with a nearby corner for a well-defined `POINT`.
+fn opposite_anchor(sel: RECT, handle: Handle) -> POINT {
+    match handle {
+        Handle::NW => POINT { x: sel.right, y: sel.bottom },
+        Handle::NE => POINT { x: sel.left, y: sel.bottom },
+        Handle::SE => POINT { x: sel.left, y: sel.top },
+        Handle::SW => POINT { x: sel.right, y: sel.top },
+        Handle::N => POINT { x: sel.left, y: sel.bottom },
+        Handle::S => POINT { x: sel.left, y: sel.top },
+        Handle::E => POINT { x: sel.left, y: sel.top },
+        Handle::W => POINT { x: sel.right, y: sel.top },
+    }
+}
+
+/// Pure routing decision for `WM_LBUTTONDOWN` (RESEARCH Pattern 3 / this
+/// plan's Task 1 behavior list): given the current selection (if any) and
+/// the clamped press point, returns the state the press transitions to plus
+/// the `Hit` it was pressed on (`Hit::Outside` also covers "no selection at
+/// all", so callers can use one rule for "started Outside or in Idle").
+///
+/// - No selection -> `DraggingNew` (fresh rubber-band).
+/// - Press on a handle -> `Resizing`, anchored at the opposite corner/edge.
+/// - Press inside the selection -> `Moving`, offset from the top-left.
+/// - Press outside an existing selection -> `DraggingNew` (D-32: fresh
+///   rectangle replaces the old one once the user actually drags).
+fn press_transition(sel: Option<RECT>, p: POINT, hit_size: i32) -> (OverlayState, Hit) {
+    match sel {
+        None => (OverlayState::DraggingNew { anchor: p }, Hit::Outside),
+        Some(s) => match hit_test(s, p, hit_size) {
+            Hit::Handle(h) => (
+                OverlayState::Resizing {
+                    handle: h,
+                    anchor: opposite_anchor(s, h),
+                },
+                Hit::Handle(h),
+            ),
+            Hit::Inside => (
+                OverlayState::Moving {
+                    grab_offset: POINT {
+                        x: p.x - s.left,
+                        y: p.y - s.top,
+                    },
+                },
+                Hit::Inside,
+            ),
+            Hit::Outside => (OverlayState::DraggingNew { anchor: p }, Hit::Outside),
+        },
+    }
+}
+
+/// Locked Open-Question-1 resolution (RESEARCH): what `VK_ESCAPE` does,
+/// decided purely from the current state -- no HWND needed to test it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EscOutcome {
+    /// Abort the in-progress drag, restoring the given pre-drag selection
+    /// (or `None` if there was none) -- does NOT close the overlay.
+    AbortDrag { restored_sel: Option<RECT> },
+    /// Idle or Selected: Esc closes the overlay. A second Esc therefore
+    /// always closes, satisfying REG-06.
+    Close,
+}
+
+/// Pure decision for `WM_KEYDOWN` `VK_ESCAPE`: `DraggingNew`/`Moving`/
+/// `Resizing` abort that drag (restoring `pre_drag_sel`); `Idle`/`Selected`
+/// close the overlay.
+fn esc_transition(state: OverlayState, pre_drag_sel: Option<RECT>) -> EscOutcome {
+    match state {
+        OverlayState::DraggingNew { .. }
+        | OverlayState::Moving { .. }
+        | OverlayState::Resizing { .. } => EscOutcome::AbortDrag {
+            restored_sel: pre_drag_sel,
+        },
+        OverlayState::Idle | OverlayState::Selected => EscOutcome::Close,
+    }
+}
+
+/// Pure cancel decision for `WM_LBUTTONUP` (REG-06/D-31/D-32): a release is a
+/// click (not a drag) that cancels the overlay only when the press that
+/// started it landed `Outside` an existing selection or on no selection at
+/// all (`press_transition` reports both as `Hit::Outside`). A click on a
+/// handle or inside the selection is a no-op, not a cancel.
+fn should_cancel_on_release(pressed_hit: Hit, was_click: bool) -> bool {
+    was_click && matches!(pressed_hit, Hit::Outside)
+}
+
+/// Extracts a client-coordinate `POINT` from a mouse message's `lParam`:
+/// low word = x, high word = y, each sign-extended from 16 bits (not simply
+/// masked/truncated), because a captured cursor can travel negative when it
+/// leaves the client area mid-drag (`SetCapture` lets it go anywhere).
+fn point_from_lparam(lparam: LPARAM) -> POINT {
+    let raw = lparam.0 as usize as u32;
+    let x = (raw & 0xFFFF) as u16 as i16 as i32;
+    let y = ((raw >> 16) & 0xFFFF) as u16 as i16 as i32;
+    POINT { x, y }
+}
+
+/// Clamps `p` into `bounds` -- every incoming mouse point is clamped before
+/// use, since `SetCapture` lets the cursor leave the monitor mid-drag.
+fn clamp_point(p: POINT, bounds: RECT) -> POINT {
+    POINT {
+        x: p.x.clamp(bounds.left, bounds.right),
+        y: p.y.clamp(bounds.top, bounds.bottom),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Window lifecycle (REG-01/REG-02, Plan 02 Task 1)
 // ---------------------------------------------------------------------
@@ -338,6 +453,19 @@ struct OverlayData {
     state: OverlayState,
     closing: bool,
     awaiting_release: bool,
+    /// Client-coord point of the most recent `WM_LBUTTONDOWN`, clamped to
+    /// `bounds`. Compared against the release point (`is_click`) to
+    /// distinguish a click from a drag (REG-06).
+    press_origin: POINT,
+    /// The hit-test result computed at the moment of `WM_LBUTTONDOWN`.
+    /// `Hit::Outside` covers both a true outside-click and a press with no
+    /// selection at all (`press_transition` returns `Hit::Outside` for
+    /// `sel: None`), matching D-31/D-32's "started Outside or in Idle" rule.
+    press_hit: Hit,
+    /// The selection as it was immediately before the current drag started
+    /// (`WM_LBUTTONDOWN`). Restored on `WM_CAPTURECHANGED` (capture stolen
+    /// mid-drag) so an aborted drag never leaves a partial rectangle.
+    pre_drag_sel: Option<RECT>,
     bright_dc: isize,
     bright_bmp: isize,
     dim_dc: isize,
@@ -628,6 +756,9 @@ pub fn open() {
         state: OverlayState::Idle,
         closing: false,
         awaiting_release: true,
+        press_origin: POINT { x: 0, y: 0 },
+        press_hit: Hit::Outside,
+        pre_drag_sel: None,
         bright_dc,
         bright_bmp,
         dim_dc,
@@ -688,11 +819,354 @@ fn cancel(hwnd: HWND) {
     }
 }
 
+// ---------------------------------------------------------------------
+// Mouse state machine + cancel matrix (REG-03/REG-06, Plan 03 Task 1)
+// ---------------------------------------------------------------------
+
+/// `WM_LBUTTONDOWN`: takes mouse capture, records the press point/hit for
+/// the eventual release decision, snapshots the pre-drag selection (for
+/// `WM_CAPTURECHANGED` recovery), and routes to the next state via the pure
+/// `press_transition` helper. Every mutation goes through `with_state` and
+/// is followed by `invalidate_change` -- here a no-op repaint since pressing
+/// down never changes the visible selection by itself.
+fn on_lbuttondown(hwnd: HWND, raw_p: POINT) {
+    unsafe {
+        let _ = SetCapture(hwnd);
+    }
+    with_state(|d| {
+        let p = clamp_point(raw_p, d.bounds);
+        let (new_state, hit) = press_transition(d.sel, p, constants::OVERLAY_HANDLE_HIT_SIZE);
+        d.press_origin = p;
+        d.press_hit = hit;
+        d.pre_drag_sel = d.sel;
+        d.state = new_state;
+    });
+}
+
+/// `WM_MOUSEMOVE`: only acts while a drag state is active; every other state
+/// (Idle, Selected) ignores movement entirely. Repaints via
+/// `invalidate_change` using the dirty union of the old and new selection.
+fn on_mousemove(hwnd: HWND, raw_p: POINT) {
+    let mut old_sel = None;
+    let mut new_sel = None;
+    let mut changed = false;
+    with_state(|d| {
+        let p = clamp_point(raw_p, d.bounds);
+        old_sel = d.sel;
+        match d.state {
+            OverlayState::DraggingNew { anchor } => {
+                d.sel = Some(clamp_rect(normalize_rect(anchor, p), d.bounds));
+                changed = true;
+            }
+            OverlayState::Resizing { handle, anchor } => {
+                if let Some(sel) = d.sel {
+                    d.sel = Some(clamp_rect(resize_rect(anchor, p, handle, sel), d.bounds));
+                    changed = true;
+                }
+            }
+            OverlayState::Moving { grab_offset } => {
+                if let Some(sel) = d.sel {
+                    let w = sel.right - sel.left;
+                    let h = sel.bottom - sel.top;
+                    let moved = RECT {
+                        left: p.x - grab_offset.x,
+                        top: p.y - grab_offset.y,
+                        right: p.x - grab_offset.x + w,
+                        bottom: p.y - grab_offset.y + h,
+                    };
+                    d.sel = Some(clamp_rect(moved, d.bounds));
+                    changed = true;
+                }
+            }
+            OverlayState::Idle | OverlayState::Selected => {}
+        }
+        new_sel = d.sel;
+    });
+    if changed {
+        invalidate_change(hwnd, old_sel, new_sel);
+    }
+}
+
+/// `WM_LBUTTONUP`: releases mouse capture, queries the live system drag
+/// threshold (never a hardcoded constant), and either cancels the overlay
+/// (a bare click that started Outside/Idle, D-31/D-32/REG-06) or settles the
+/// current drag into `Selected`/`Idle`.
+fn on_lbuttonup(hwnd: HWND, raw_p: POINT) {
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    let cx_drag = unsafe { GetSystemMetrics(SM_CXDRAG) };
+    let cy_drag = unsafe { GetSystemMetrics(SM_CYDRAG) };
+
+    let mut should_cancel = false;
+    let mut old_sel = None;
+    let mut new_sel = None;
+    with_state(|d| {
+        let p = clamp_point(raw_p, d.bounds);
+        old_sel = d.sel;
+        let was_click = is_click(d.press_origin, p, cx_drag, cy_drag);
+        if should_cancel_on_release(d.press_hit, was_click) {
+            should_cancel = true;
+        } else {
+            d.state = if d.sel.is_some() {
+                OverlayState::Selected
+            } else {
+                OverlayState::Idle
+            };
+        }
+        new_sel = d.sel;
+    });
+
+    if should_cancel {
+        cancel(hwnd);
+    } else if old_sel != new_sel {
+        invalidate_change(hwnd, old_sel, new_sel);
+    }
+}
+
+/// `WM_RBUTTONDOWN`: right-click anywhere cancels (D-34). Capture is
+/// released first in case a drag was in progress.
+fn on_rbuttondown(hwnd: HWND) {
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    cancel(hwnd);
+}
+
+/// `WM_CAPTURECHANGED`: mouse capture was stolen mid-drag (e.g. another
+/// window/process grabbed it). Aborts the drag by restoring the pre-drag
+/// selection rather than cancelling the overlay outright.
+fn on_capturechanged(hwnd: HWND) {
+    let mut old_sel = None;
+    let mut new_sel = None;
+    let mut changed = false;
+    with_state(|d| {
+        if matches!(
+            d.state,
+            OverlayState::DraggingNew { .. }
+                | OverlayState::Moving { .. }
+                | OverlayState::Resizing { .. }
+        ) {
+            old_sel = d.sel;
+            d.sel = d.pre_drag_sel;
+            d.state = if d.sel.is_some() {
+                OverlayState::Selected
+            } else {
+                OverlayState::Idle
+            };
+            new_sel = d.sel;
+            changed = true;
+        }
+    });
+    if changed {
+        invalidate_change(hwnd, old_sel, new_sel);
+    }
+}
+
+/// Shared guard for the two silent-cancel triggers (`WM_ACTIVATE(WA_INACTIVE)`
+/// and `WM_KILLFOCUS`, D-33): cancels unless the overlay is already tearing
+/// down. The `closing` check is mandatory -- `DestroyWindow` itself
+/// deactivates the window and would otherwise re-enter `cancel()` (Pitfall 4).
+fn cancel_on_focus_loss(hwnd: HWND) {
+    let already_closing = with_state(|d| d.closing).unwrap_or(true);
+    if !already_closing {
+        cancel(hwnd);
+    }
+}
+
+/// `WM_ACTIVATE`: silent cancel when the window is being deactivated
+/// (`WA_INACTIVE`, D-33) -- Alt+Tab, another app stealing focus, the Win
+/// key, etc. Nothing saved, no toast.
+fn on_activate(hwnd: HWND, wparam: WPARAM) {
+    let inactive = (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE;
+    if inactive {
+        cancel_on_focus_loss(hwnd);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Cursor mapping + keyboard handling (REG-03/D-30, Plan 03 Task 2)
+// ---------------------------------------------------------------------
+
+/// Maps a resize handle to its UI-SPEC system cursor (D-26).
+fn cursor_for_handle(handle: Handle) -> PCWSTR {
+    match handle {
+        Handle::NW | Handle::SE => IDC_SIZENWSE,
+        Handle::NE | Handle::SW => IDC_SIZENESW,
+        Handle::E | Handle::W => IDC_SIZEWE,
+        Handle::N | Handle::S => IDC_SIZENS,
+    }
+}
+
+/// Pure cursor-selection decision (UI-SPEC cursor table): while a drag is
+/// active the cursor matches the operation itself (crosshair while drawing,
+/// move cursor while moving, the resize arrow for the handle being dragged);
+/// otherwise it follows `hit_test` under the current point.
+fn cursor_for_state(state: OverlayState, sel: Option<RECT>, p: POINT, hit_size: i32) -> PCWSTR {
+    match state {
+        OverlayState::DraggingNew { .. } => IDC_CROSS,
+        OverlayState::Moving { .. } => IDC_SIZEALL,
+        OverlayState::Resizing { handle, .. } => cursor_for_handle(handle),
+        OverlayState::Idle => IDC_CROSS,
+        OverlayState::Selected => match sel {
+            Some(s) => match hit_test(s, p, hit_size) {
+                Hit::Outside => IDC_CROSS,
+                Hit::Inside => IDC_SIZEALL,
+                Hit::Handle(h) => cursor_for_handle(h),
+            },
+            None => IDC_CROSS,
+        },
+    }
+}
+
+/// `WM_SETCURSOR`: computes the hit under the current cursor position and
+/// sets a system cursor per the UI-SPEC table, then returns `LRESULT(1)` so
+/// the null class cursor never takes over. No custom cursor resources.
+fn on_setcursor(hwnd: HWND) -> LRESULT {
+    let cursor_id = with_state(|d| {
+        let mut screen_pt = POINT::default();
+        let p = unsafe {
+            if GetCursorPos(&mut screen_pt).is_ok() && ScreenToClient(hwnd, &mut screen_pt).as_bool()
+            {
+                screen_pt
+            } else {
+                POINT { x: 0, y: 0 }
+            }
+        };
+        cursor_for_state(d.state, d.sel, p, constants::OVERLAY_HANDLE_HIT_SIZE)
+    })
+    .unwrap_or(IDC_CROSS);
+    unsafe {
+        if let Ok(cursor) = LoadCursorW(None, cursor_id) {
+            SetCursor(Some(cursor));
+        }
+    }
+    LRESULT(1)
+}
+
+/// Plan 04 confirm seam: crops the frozen bitmap and dispatches through the
+/// existing Phase 2 save pipeline. Not implemented yet -- this plan only
+/// wires the input path that calls it (`VK_RETURN`, and later
+/// `WM_LBUTTONDBLCLK`/Shift+F9 re-press).
+fn confirm(_hwnd: HWND) {
+    // Plan 04 fills this in (RESEARCH Pattern 4: normalize -> crop frozen ->
+    // clipboard -> save::reserve_and_dispatch). Left as a documented no-op
+    // rather than inventing a partial save path here.
+}
+
+/// `WM_KEYDOWN`: Esc (locked Open-Question-1 semantics), Enter (confirm
+/// seam), and arrow/Shift+arrow nudge-or-resize (D-30). Arrow keys never
+/// fire in `Idle` (no selection) or mid-mouse-drag. Relies on native
+/// keyboard autorepeat for held keys -- no `SetTimer` (D-23).
+fn on_keydown(hwnd: HWND, vk: VIRTUAL_KEY) {
+    match vk {
+        VK_ESCAPE => {
+            let mut old_sel = None;
+            let mut new_sel = None;
+            let mut outcome = EscOutcome::Close;
+            with_state(|d| {
+                outcome = esc_transition(d.state, d.pre_drag_sel);
+                if let EscOutcome::AbortDrag { restored_sel } = outcome {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    old_sel = d.sel;
+                    d.sel = restored_sel;
+                    d.state = if d.sel.is_some() {
+                        OverlayState::Selected
+                    } else {
+                        OverlayState::Idle
+                    };
+                    new_sel = d.sel;
+                }
+            });
+            match outcome {
+                EscOutcome::Close => cancel(hwnd),
+                EscOutcome::AbortDrag { .. } => invalidate_change(hwnd, old_sel, new_sel),
+            }
+        }
+        VK_RETURN => {
+            let has_sel = with_state(|d| d.sel.is_some()).unwrap_or(false);
+            if has_sel {
+                confirm(hwnd);
+            }
+        }
+        VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
+            let (dx, dy) = match vk {
+                VK_LEFT => (-1, 0),
+                VK_RIGHT => (1, 0),
+                VK_UP => (0, -1),
+                VK_DOWN => (0, 1),
+                _ => unreachable!(),
+            };
+            let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            let mut old_sel = None;
+            let mut new_sel = None;
+            let mut changed = false;
+            with_state(|d| {
+                // Arrow keys never fire in Idle (no selection) or mid-drag.
+                if d.state == OverlayState::Selected {
+                    if let Some(sel) = d.sel {
+                        old_sel = Some(sel);
+                        d.sel = Some(if shift_down {
+                            grow_rect(sel, dx, dy, d.bounds)
+                        } else {
+                            nudge_rect(sel, dx, dy, d.bounds)
+                        });
+                        new_sel = d.sel;
+                        changed = true;
+                    }
+                }
+            });
+            if changed {
+                invalidate_change(hwnd, old_sel, new_sel);
+            }
+        }
+        _ => {}
+    }
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             unsafe { paint(hwnd) };
+            LRESULT(0)
+        }
+        WM_SETCURSOR => on_setcursor(hwnd),
+        WM_LBUTTONDOWN => {
+            on_lbuttondown(hwnd, point_from_lparam(lparam));
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            on_mousemove(hwnd, point_from_lparam(lparam));
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            on_lbuttonup(hwnd, point_from_lparam(lparam));
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            on_rbuttondown(hwnd);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            on_capturechanged(hwnd);
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            on_activate(hwnd, wparam);
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            cancel_on_focus_loss(hwnd);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            // wparam is a virtual-key code -- opaque, matched not
+            // dereferenced (T-01-04 convention); unmatched keys are ignored
+            // inside `on_keydown` itself.
+            on_keydown(hwnd, VIRTUAL_KEY(wparam.0 as u16));
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1093,5 +1567,179 @@ mod tests {
             anchor: pt(0, 0),
         };
         assert_ne!(moving, resizing);
+    }
+
+    // -- Task 1: press_transition / should_cancel_on_release --------------
+
+    #[test]
+    fn press_transition_with_no_selection_starts_dragging_new() {
+        let (state, hit) = press_transition(None, pt(50, 50), 16);
+        assert_eq!(state, OverlayState::DraggingNew { anchor: pt(50, 50) });
+        assert_eq!(hit, Hit::Outside);
+    }
+
+    #[test]
+    fn press_transition_outside_existing_selection_replaces_it_d32() {
+        let sel = rect(100, 100, 200, 200);
+        let (state, hit) = press_transition(Some(sel), pt(0, 0), 16);
+        assert_eq!(state, OverlayState::DraggingNew { anchor: pt(0, 0) });
+        assert_eq!(hit, Hit::Outside);
+    }
+
+    #[test]
+    fn press_transition_inside_selection_starts_moving() {
+        let sel = rect(100, 100, 200, 200);
+        let (state, hit) = press_transition(Some(sel), pt(150, 150), 16);
+        assert_eq!(
+            state,
+            OverlayState::Moving {
+                grab_offset: pt(50, 50)
+            }
+        );
+        assert_eq!(hit, Hit::Inside);
+    }
+
+    #[test]
+    fn press_transition_on_handle_starts_resizing_at_opposite_corner() {
+        let sel = rect(100, 100, 200, 200);
+        let (state, hit) = press_transition(Some(sel), pt(198, 198), 16);
+        assert_eq!(
+            state,
+            OverlayState::Resizing {
+                handle: Handle::SE,
+                anchor: pt(100, 100)
+            }
+        );
+        assert_eq!(hit, Hit::Handle(Handle::SE));
+    }
+
+    #[test]
+    fn should_cancel_on_release_only_for_outside_click() {
+        // Click-outside-no-drag cancels (D-31/D-32, REG-06).
+        assert!(should_cancel_on_release(Hit::Outside, true));
+        // Click-on-handle does not cancel.
+        assert!(!should_cancel_on_release(Hit::Handle(Handle::SE), true));
+        // Click inside does not cancel.
+        assert!(!should_cancel_on_release(Hit::Inside, true));
+        // A real drag (not a click) never cancels, regardless of start hit.
+        assert!(!should_cancel_on_release(Hit::Outside, false));
+    }
+
+    #[test]
+    fn resize_past_anchor_via_press_and_resize_stays_valid() {
+        // SE handle pressed, then dragged past its NW anchor -- the
+        // resulting rect must still be valid (non-negative, normalized).
+        let sel = rect(100, 100, 200, 200);
+        let (state, _) = press_transition(Some(sel), pt(198, 198), 16);
+        let anchor = match state {
+            OverlayState::Resizing { anchor, .. } => anchor,
+            _ => panic!("expected Resizing"),
+        };
+        let out = resize_rect(anchor, pt(50, 60), Handle::SE, sel);
+        assert_eq!(out, rect(50, 60, 100, 100));
+    }
+
+    // -- Task 2: point/coordinate helpers, cursor mapping, Esc semantics --
+
+    #[test]
+    fn point_from_lparam_sign_extends_negative_coords() {
+        // A captured cursor that has left the client area produces negative
+        // 16-bit coordinates in lParam.
+        let lparam = LPARAM((0xFFF6u16 as u32 | ((0xFFECu16 as u32) << 16)) as isize);
+        let p = point_from_lparam(lparam);
+        assert_eq!(p, pt(-10, -20));
+    }
+
+    #[test]
+    fn point_from_lparam_positive_coords() {
+        let lparam = LPARAM((100u32 | (200u32 << 16)) as isize);
+        let p = point_from_lparam(lparam);
+        assert_eq!(p, pt(100, 200));
+    }
+
+    #[test]
+    fn cursor_for_state_maps_all_six_ui_spec_zones() {
+        let sel = rect(100, 100, 200, 200);
+        assert_eq!(
+            cursor_for_state(OverlayState::Idle, None, pt(0, 0), 16).0,
+            IDC_CROSS.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(150, 150), 16).0,
+            IDC_SIZEALL.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(100, 100), 16).0,
+            IDC_SIZENWSE.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(200, 100), 16).0,
+            IDC_SIZENESW.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(200, 150), 16).0,
+            IDC_SIZEWE.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(150, 100), 16).0,
+            IDC_SIZENS.0
+        );
+        assert_eq!(
+            cursor_for_state(OverlayState::Selected, Some(sel), pt(0, 0), 16).0,
+            IDC_CROSS.0
+        );
+    }
+
+    #[test]
+    fn esc_during_drag_aborts_without_closing() {
+        let prior = Some(rect(10, 10, 20, 20));
+        for state in [
+            OverlayState::DraggingNew { anchor: pt(0, 0) },
+            OverlayState::Moving {
+                grab_offset: pt(0, 0),
+            },
+            OverlayState::Resizing {
+                handle: Handle::SE,
+                anchor: pt(0, 0),
+            },
+        ] {
+            assert_eq!(
+                esc_transition(state, prior),
+                EscOutcome::AbortDrag {
+                    restored_sel: prior
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn esc_in_idle_or_selected_closes() {
+        assert_eq!(esc_transition(OverlayState::Idle, None), EscOutcome::Close);
+        assert_eq!(
+            esc_transition(OverlayState::Selected, Some(rect(0, 0, 10, 10))),
+            EscOutcome::Close
+        );
+    }
+
+    #[test]
+    fn cursor_for_state_reflects_active_drag_not_static_hit() {
+        // While moving, the cursor stays IDC_SIZEALL even if the point
+        // passed happens to sit over what would be a handle zone at rest.
+        let sel = rect(100, 100, 200, 200);
+        let moving = OverlayState::Moving {
+            grab_offset: pt(0, 0),
+        };
+        assert_eq!(
+            cursor_for_state(moving, Some(sel), pt(100, 100), 16).0,
+            IDC_SIZEALL.0
+        );
+        let resizing = OverlayState::Resizing {
+            handle: Handle::N,
+            anchor: pt(0, 0),
+        };
+        assert_eq!(
+            cursor_for_state(resizing, Some(sel), pt(150, 150), 16).0,
+            IDC_SIZENS.0
+        );
     }
 }

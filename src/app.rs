@@ -253,7 +253,12 @@ pub fn dispatch(action: AppAction) {
             toast::show("Settings — coming in a later version");
         }
         AppAction::OpenCaptureFolder => {
-            let dir = constants::default_capture_dir();
+            // WR-03: resolve the folder from config exactly like the save
+            // pipeline does (D-11: re-read at action time) -- opening the
+            // hardcoded default would diverge from where saves actually go
+            // for users with a customized save_folder.
+            let cfg = config::load();
+            let dir = config::resolve_save_folder(&cfg);
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 // Same seam ERR-01 formalizes in Phase 2 -- toast the OS
                 // error rather than panicking.

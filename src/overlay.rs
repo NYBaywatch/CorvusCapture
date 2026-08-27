@@ -25,8 +25,8 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, Rectangle, RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, NULL_BRUSH, NULL_PEN,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
@@ -1422,7 +1422,11 @@ unsafe fn paint(hwnd: HWND) {
 
                 let chip_brush = CreateSolidBrush(COLORREF(constants::OVERLAY_CHIP_FILL));
                 let old_brush = SelectObject(back_hdc, chip_brush.into());
-                let old_pen2 = SelectObject(back_hdc, GetStockObject(NULL_BRUSH));
+                // NULL_PEN (not NULL_BRUSH) suppresses the outline while the
+                // chip fill draws with chip_brush; selecting NULL_BRUSH here
+                // replaced chip_brush and made every DeleteObject below fail
+                // and leak one brush per paint (CR-04).
+                let old_pen2 = SelectObject(back_hdc, GetStockObject(NULL_PEN));
                 let _ = RoundRect(
                     back_hdc,
                     chip.left,
@@ -1432,8 +1436,8 @@ unsafe fn paint(hwnd: HWND) {
                     constants::OVERLAY_CHIP_RADIUS * 2,
                     constants::OVERLAY_CHIP_RADIUS * 2,
                 );
-                SelectObject(back_hdc, old_brush);
                 SelectObject(back_hdc, old_pen2);
+                SelectObject(back_hdc, old_brush); // deselects chip_brush
                 let _ = DeleteObject(chip_brush.into());
 
                 SetBkMode(back_hdc, TRANSPARENT);

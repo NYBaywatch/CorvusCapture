@@ -1500,7 +1500,33 @@ fn invalidate_change(hwnd: HWND, old_sel: Option<RECT>, new_sel: Option<RECT>) {
                 let approx_w = (text.chars().count() as i32) * constants::OVERLAY_FONT_HEIGHT
                     + 2 * constants::OVERLAY_READOUT_PAD_X;
                 let approx_h = constants::OVERLAY_FONT_HEIGHT + 2 * constants::OVERLAY_READOUT_PAD_Y;
-                readout_rect(s, approx_w, approx_h, bounds)
+                // WR-01: the estimated width (~2x the real glyph width) can
+                // flip `readout_rect`'s corner decision differently than
+                // paint()'s DT_CALCRECT-measured width near the right/bottom
+                // edge, leaving the real chip outside the invalidated
+                // region. Instead of trusting one placement, union BOTH
+                // candidates (default outside-corner and flipped
+                // inside-corner); the real, smaller chip always lies within
+                // whichever candidate paint() picks.
+                let gap = constants::OVERLAY_READOUT_GAP;
+                let default_chip = RECT {
+                    left: s.right + gap,
+                    top: s.bottom + gap,
+                    right: s.right + gap + approx_w,
+                    bottom: s.bottom + gap + approx_h,
+                };
+                let flipped_chip = RECT {
+                    left: s.right - gap - approx_w,
+                    top: s.bottom - gap - approx_h,
+                    right: s.right - gap,
+                    bottom: s.bottom - gap,
+                };
+                RECT {
+                    left: default_chip.left.min(flipped_chip.left),
+                    top: default_chip.top.min(flipped_chip.top),
+                    right: default_chip.right.max(flipped_chip.right),
+                    bottom: default_chip.bottom.max(flipped_chip.bottom),
+                }
             }
             None => RECT::default(),
         }

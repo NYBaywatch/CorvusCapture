@@ -283,9 +283,13 @@ fn encode_and_write(job: SaveJob) -> Result<String, String> {
     // BGRA -> RGBA channel swap (bytes 0 and 2 of every 4-byte pixel) --
     // this MUST happen before any `image` encoder call. This is the single
     // most likely correctness bug in the phase (RESEARCH.md assumption A3).
+    // The alpha byte from GDI capture is undefined (BitBlt/PrintWindow into
+    // a 32bpp DIB commonly leaves it 0x00), so it is forced opaque here --
+    // otherwise PNG/WebP/BMP output can render fully transparent.
     let mut rgba = bitmap.bgra;
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.swap(0, 2);
+        pixel[3] = 0xFF; // GDI capture alpha is undefined; screenshots are opaque
     }
 
     let mut buf: Vec<u8> = Vec::new();
@@ -514,9 +518,11 @@ mod tests {
     fn png_roundtrip_proves_bgra_to_rgba_swap() {
         use image::GenericImageView;
 
-        // Top-left pixel BGRA(0, 0, 255, 255) = pure red once swapped to RGBA.
+        // Top-left pixel BGRA(0, 0, 255, 0) = pure red once swapped to RGBA.
+        // Its alpha byte is 0 -- exactly what GDI capture commonly produces
+        // (undefined alpha) -- and must come out of the PNG as 255 (CR-01).
         let bgra = vec![
-            0, 0, 255, 255, // top-left: B=0 G=0 R=255 A=255
+            0, 0, 255, 0, // top-left: B=0 G=0 R=255 A=0 (undefined GDI alpha)
             0, 255, 0, 255, // top-right: green
             255, 0, 0, 255, // bottom-left: blue
             255, 255, 255, 255, // bottom-right: white
@@ -525,6 +531,7 @@ mod tests {
         let mut rgba = bgra.clone();
         for pixel in rgba.chunks_exact_mut(4) {
             pixel.swap(0, 2);
+            pixel[3] = 0xFF;
         }
 
         let mut buf = Vec::new();
@@ -536,6 +543,6 @@ mod tests {
 
         let decoded = image::load_from_memory(&buf).unwrap();
         let top_left = decoded.get_pixel(0, 0);
-        assert_eq!(top_left.0, [255, 0, 0, 255], "expected red, got {:?} -- BGRA/RGBA swap missing or wrong", top_left.0);
+        assert_eq!(top_left.0, [255, 0, 0, 255], "expected opaque red, got {:?} -- BGRA/RGBA swap or alpha-force missing/wrong", top_left.0);
     }
 }

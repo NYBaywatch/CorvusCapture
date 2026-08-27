@@ -9,6 +9,7 @@ mod clipboard;
 mod config;
 mod constants;
 mod hotkeys;
+mod overlay;
 mod save;
 mod singleinstance;
 mod toast;

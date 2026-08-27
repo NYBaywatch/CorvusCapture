@@ -110,6 +110,103 @@ pub const TMP_SUFFIX: &str = ".tmp";
 pub const CAPTURE_EXTENSIONS: [&str; 4] = ["png", "jpg", "bmp", "webp"];
 
 // ---------------------------------------------------------------------
+// Overlay (Phase 3)
+// ---------------------------------------------------------------------
+
+/// Builds a COLORREF from RGB components. COLORREF byte order is
+/// `0x00BBGGRR` (RESEARCH Pitfall 5 -- easy to get backwards).
+pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    (b as u32) << 16 | (g as u32) << 8 | r as u32
+}
+
+/// Window class name for the Shift+F9 region-selection overlay.
+///
+/// Not yet consumed: window creation arrives in Phase 3 Plan 02.
+#[allow(dead_code)]
+pub const OVERLAY_WINDOW_CLASS: &str = "CorvusCaptureOverlayWnd";
+
+/// Matrix green `#00FF41` (D-24): selection border, resize handles, and
+/// readout chip text -- nowhere else.
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_ACCENT: u32 = rgb(0x00, 0xFF, 0x41);
+
+/// Readout chip fill (D-29), matches the existing toast fill exactly.
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_CHIP_FILL: u32 = 0x0020_2020;
+
+/// `AlphaBlend` `SourceConstantAlpha` for the frozen-frame dim (REG-02).
+/// ~40% dim; UI-SPEC permits 96-112 discretion, shipped value recorded here.
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_DIM_ALPHA: u8 = 102;
+
+/// Selection border stroke width in physical pixels (D-23).
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_BORDER_WIDTH: i32 = 2;
+
+/// Visual size (in pixels) of each of the 8 resize-handle squares (D-25).
+///
+/// Not yet consumed outside tests: call sites arrive once window/paint code
+/// exists in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_HANDLE_SIZE: i32 = 8;
+
+/// Hit-test target size for a resize handle -- inflated beyond the visual
+/// square so handles are easy to grab (discretion).
+///
+/// Not yet consumed outside tests: call sites arrive once window/paint code
+/// exists in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_HANDLE_HIT_SIZE: i32 = 16;
+
+/// Gap in pixels between the selection's bottom-right corner and the
+/// dimension readout chip (D-27).
+///
+/// Not yet consumed: `overlay::readout_rect` (Task 2 of this plan) is the
+/// first call site.
+#[allow(dead_code)]
+pub const OVERLAY_READOUT_GAP: i32 = 8;
+
+/// Horizontal padding inside the readout chip, per side (UI-SPEC typography).
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_READOUT_PAD_X: i32 = 8;
+
+/// Vertical padding inside the readout chip, per side (UI-SPEC typography).
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_READOUT_PAD_Y: i32 = 4;
+
+/// Distance in pixels from a client edge within which the readout chip's
+/// default placement flips to avoid clipping (D-27 corner flip).
+///
+/// Not yet consumed: `overlay::readout_rect` (Task 2 of this plan) is the
+/// first call site.
+#[allow(dead_code)]
+pub const OVERLAY_READOUT_EDGE_THRESHOLD: i32 = 24;
+
+/// Readout chip corner radius; `RoundRect` ellipse is 2x this (UI-SPEC).
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_CHIP_RADIUS: i32 = 6;
+
+/// Readout chip font height in pixels, matches the existing toast (UI-SPEC).
+///
+/// Not yet consumed: paint code arrives in Phase 3 Plan 02/03.
+#[allow(dead_code)]
+pub const OVERLAY_FONT_HEIGHT: i32 = 18;
+
+// ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
 
@@ -117,4 +214,16 @@ pub const CAPTURE_EXTENSIONS: [&str; 4] = ["png", "jpg", "bmp", "webp"];
 /// Win32 `PCWSTR` arguments.
 pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_packs_colorref_byte_order() {
+        // COLORREF is 0x00BBGGRR (RESEARCH Pitfall 5) -- matrix green
+        // #00FF41 must pack to 0x0041FF00, not 0x0000FF41.
+        assert_eq!(rgb(0x00, 0xFF, 0x41), 0x0041_FF00);
+    }
 }

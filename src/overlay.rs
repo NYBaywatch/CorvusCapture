@@ -798,8 +798,13 @@ fn free_dc_bmp(dc: isize, bmp: isize) {
     unsafe {
         let hdc = windows::Win32::Graphics::Gdi::HDC(dc as *mut c_void);
         let hbmp = windows::Win32::Graphics::Gdi::HBITMAP(bmp as *mut c_void);
-        let _ = DeleteObject(hbmp.into());
+        // The DIB is still selected into the DC (create_dib_dc never
+        // restores the stock bitmap), and DeleteObject fails for an object
+        // selected into a DC -- deleting in the wrong order leaked every
+        // monitor-sized DIB section per overlay session (CR-03). Delete the
+        // DC first so the bitmap is deselected, then delete the bitmap.
         let _ = DeleteDC(hdc);
+        let _ = DeleteObject(hbmp.into());
     }
 }
 

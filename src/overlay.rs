@@ -1187,9 +1187,6 @@ fn on_keydown(hwnd: HWND, vk: VIRTUAL_KEY) {
             with_state(|d| {
                 outcome = esc_transition(d.state, d.pre_drag_sel);
                 if let EscOutcome::AbortDrag { restored_sel } = outcome {
-                    unsafe {
-                        let _ = ReleaseCapture();
-                    }
                     old_sel = d.sel;
                     d.sel = restored_sel;
                     d.state = if d.sel.is_some() {
@@ -1202,7 +1199,19 @@ fn on_keydown(hwnd: HWND, vk: VIRTUAL_KEY) {
             });
             match outcome {
                 EscOutcome::Close => cancel(hwnd),
-                EscOutcome::AbortDrag { .. } => invalidate_change(hwnd, old_sel, new_sel),
+                EscOutcome::AbortDrag { .. } => {
+                    // ReleaseCapture must run AFTER the OVERLAY_DATA guard
+                    // is dropped: it synchronously sends WM_CAPTURECHANGED
+                    // to this window, whose handler re-locks the
+                    // non-reentrant mutex -- calling it inside the closure
+                    // deadlocks the pump thread under a fullscreen topmost
+                    // overlay (CR-02). The state is already settled above,
+                    // so on_capturechanged no-ops.
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    invalidate_change(hwnd, old_sel, new_sel)
+                }
             }
         }
         VK_RETURN => {

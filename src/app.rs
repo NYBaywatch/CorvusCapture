@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::about;
 use crate::constants;
 use crate::hotkeys;
+use crate::overlay;
 use crate::singleinstance;
 use crate::toast;
 use crate::tray;
@@ -235,6 +236,18 @@ pub fn run_message_loop() {
 pub fn dispatch(action: AppAction) {
     match action {
         AppAction::Exit => unsafe { PostQuitMessage(0) },
+        // D-36 + the locked Open-Question-2 resolution (03-04-PLAN.md
+        // <interfaces>): the overlay is fully modal. Fullscreen/active-window
+        // capture and Settings are all swallowed while it is up -- opening
+        // Settings under a topmost overlay would itself trip the D-33
+        // focus-loss cancel, producing a confusing cancel-then-settings.
+        // Swallowed means a literal no-op: no toast, no log, no side effect.
+        AppAction::CaptureFullscreen | AppAction::CaptureActiveWindow | AppAction::OpenSettings
+            if overlay::is_active() => {}
+        // D-35: Shift+F9 while the overlay is up is a toggle -- confirm if a
+        // selection exists, cancel otherwise (guarded against hotkey
+        // autorepeat inside hotkey_toggle itself).
+        AppAction::CaptureRegion if overlay::is_active() => overlay::hotkey_toggle(),
         // Phase 1 stub (TRAY-03): the real Settings window is Phase 4.
         AppAction::OpenSettings => {
             toast::show("Settings — coming in a later version");
@@ -270,9 +283,10 @@ pub fn dispatch(action: AppAction) {
         AppAction::CaptureActiveWindow => {
             run_capture(CaptureSource::ActiveWindow);
         }
-        // Phase 3: Shift+F9 frozen-overlay region capture.
+        // Phase 3: Shift+F9 frozen-overlay region capture -- the overlay is
+        // not yet open (the `is_active()` guard above handles that case).
         AppAction::CaptureRegion => {
-            toast::show("Shift+F9 — region capture (coming soon)");
+            overlay::open();
         }
     }
 }

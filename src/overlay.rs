@@ -32,20 +32,23 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_DOWN, VK_ESCAPE, VK_LEFT,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetAsyncKeyState, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VIRTUAL_KEY, VK_DOWN,
+    VK_ESCAPE, VK_F9, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
     GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetForegroundWindow, ShowWindow,
     CS_DBLCLKS, IDC_CROSS, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     SM_CXDRAG, SM_CYDRAG, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::app::{self, AppAction};
 use crate::capture::{self, RawBitmap};
 use crate::constants;
+use crate::{clipboard, config, save};
 
 // ---------------------------------------------------------------------
 // Types
@@ -819,6 +822,40 @@ fn cancel(hwnd: HWND) {
     }
 }
 
+/// D-35 toggle entry point for a `CaptureRegion` hotkey event that arrives
+/// while the overlay is already open (`app::dispatch`'s modality gate calls
+/// this instead of `open()`). Confirms when a selection exists, cancels
+/// otherwise -- gated by the RESEARCH Pitfall 1 autorepeat guard so that
+/// holding Shift+F9 down does not instantly close the overlay it just
+/// opened.
+pub fn hotkey_toggle() {
+    let hwnd_raw = *OVERLAY_HWND.lock().unwrap();
+    let Some(raw) = hwnd_raw else {
+        return;
+    };
+    let hwnd = HWND(raw as *mut c_void);
+
+    let awaiting = with_state(|d| d.awaiting_release).unwrap_or(false);
+    if awaiting {
+        // The opening press may still be physically down, autorepeating
+        // WM_HOTKEY -- ignore this event until it is observed up. A genuine
+        // re-press necessarily has a release in between, so D-35's toggle
+        // semantics are preserved exactly.
+        let f9_down = unsafe { GetAsyncKeyState(VK_F9.0 as i32) } < 0;
+        if f9_down {
+            return;
+        }
+        with_state(|d| d.awaiting_release = false);
+    }
+
+    let has_sel = with_state(|d| d.sel.is_some()).unwrap_or(false);
+    if has_sel {
+        confirm(hwnd);
+    } else {
+        cancel(hwnd);
+    }
+}
+
 // ---------------------------------------------------------------------
 // Mouse state machine + cancel matrix (REG-03/REG-06, Plan 03 Task 1)
 // ---------------------------------------------------------------------
@@ -921,6 +958,27 @@ fn on_lbuttonup(hwnd: HWND, raw_p: POINT) {
         cancel(hwnd);
     } else if old_sel != new_sel {
         invalidate_change(hwnd, old_sel, new_sel);
+    }
+}
+
+/// `WM_LBUTTONDBLCLK`: confirms only when the first click of the pair landed
+/// `Hit::Inside` the current selection (D-32/RESEARCH Pattern 4). A
+/// double-click OUTSIDE the selection is not a confirm -- `WM_LBUTTONDOWN`
+/// already ran for both clicks and treats an outside press as a normal
+/// button-down starting a fresh drag; this handler only adds the confirm
+/// behavior for the inside case. `CS_DBLCLKS` is already on the class
+/// (Plan 02), so no timestamp/position matching is hand-rolled here.
+fn on_lbuttondblclk(hwnd: HWND, raw_p: POINT) {
+    let confirms = with_state(|d| {
+        let p = clamp_point(raw_p, d.bounds);
+        matches!(
+            d.sel.map(|s| hit_test(s, p, constants::OVERLAY_HANDLE_HIT_SIZE)),
+            Some(Hit::Inside)
+        )
+    })
+    .unwrap_or(false);
+    if confirms {
+        confirm(hwnd);
     }
 }
 
@@ -1044,14 +1102,69 @@ fn on_setcursor(hwnd: HWND) -> LRESULT {
     LRESULT(1)
 }
 
-/// Plan 04 confirm seam: crops the frozen bitmap and dispatches through the
-/// existing Phase 2 save pipeline. Not implemented yet -- this plan only
-/// wires the input path that calls it (`VK_RETURN`, and later
-/// `WM_LBUTTONDBLCLK`/Shift+F9 re-press).
-fn confirm(_hwnd: HWND) {
-    // Plan 04 fills this in (RESEARCH Pattern 4: normalize -> crop frozen ->
-    // clipboard -> save::reserve_and_dispatch). Left as a documented no-op
-    // rather than inventing a partial save path here.
+/// Confirm path (REG-05, RESEARCH Pattern 4): crops the untouched frozen
+/// bitmap and hands it to the unmodified Phase 2 save pipeline. No-op if no
+/// selection exists (Enter/double-click/Shift+F9 in `Idle` is neither a save
+/// nor a cancel).
+///
+/// Ordering matters -- the window must be gone before the save runs so the
+/// screen is restored instantly: `closing` is set and the frozen bitmap is
+/// moved out and cropped BEFORE `DestroyWindow`, so `WM_DESTROY`'s cleanup
+/// (which frees the DIBs/DCs and drops whatever `frozen` is left behind)
+/// races nothing.
+fn confirm(hwnd: HWND) {
+    let cropped = with_state(|d| {
+        d.sel.map(|sel| {
+            // Pitfall 4: mark closing before DestroyWindow so the
+            // WA_INACTIVE re-entrancy guard no-ops instead of double-firing
+            // this path.
+            d.closing = true;
+            // Move the saved-pixel source of truth out of the state and
+            // replace it with an empty placeholder -- the placeholder is
+            // dropped, unused, when WM_DESTROY tears down the rest of
+            // OverlayData a moment later.
+            let frozen = std::mem::replace(
+                &mut d.frozen,
+                RawBitmap {
+                    width: 0,
+                    height: 0,
+                    bgra: Vec::new(),
+                },
+            );
+            // Crop the frozen buffer ONLY -- never a DIB, never a re-grab
+            // (REG-05/Pitfall 3): a re-capture would bake the dim and the
+            // green chrome into the saved file.
+            capture::crop_bitmap(
+                &frozen,
+                sel.left,
+                sel.top,
+                sel.right - sel.left,
+                sel.bottom - sel.top,
+            )
+        })
+    })
+    .flatten();
+
+    let Some(cropped) = cropped else {
+        return;
+    };
+
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+
+    let cfg = config::load(); // D-11: re-read at action time, like run_capture.
+    if cfg.clipboard_enabled {
+        // D-16: failure is non-fatal -- the file save proceeds regardless.
+        let _ = clipboard::copy_dib(&cropped);
+    }
+    // ERR-01 seam mirrored verbatim from app.rs::run_capture. `advisory` is
+    // `None`: a region is always within one monitor by construction
+    // (REG-01), so `monitor_span_count` does not apply.
+    if let Err(e) = save::reserve_and_dispatch(cropped, &cfg, None) {
+        crate::toast::show(&format!("Save failed — {e} — opening Settings"));
+        app::dispatch(AppAction::OpenSettings);
+    }
 }
 
 /// `WM_KEYDOWN`: Esc (locked Open-Question-1 semantics), Enter (confirm
@@ -1144,6 +1257,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONUP => {
             on_lbuttonup(hwnd, point_from_lparam(lparam));
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            on_lbuttondblclk(hwnd, point_from_lparam(lparam));
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {

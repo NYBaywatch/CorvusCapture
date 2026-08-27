@@ -1,19 +1,44 @@
 //! Shift+F9 region-selection overlay (REG-01..06).
 //!
-//! This module owns the pure, HWND-free selection-geometry core: types and
-//! functions here do no windowing, no GDI, and no `unsafe` -- they are
-//! proven correct by unit tests before any window exists. The window,
-//! paint routine, and input handling that consume this contract arrive in
-//! Phase 3 Plans 02-04.
+//! This module owns the pure, HWND-free selection-geometry core (types and
+//! functions proven correct by unit tests before any window exists) plus,
+//! from this plan onward, the window itself: class registration, the
+//! `open()`/`cancel()`/`is_active()` lifecycle, the frozen/dimmed/back-buffer
+//! DIBs, and the `WM_PAINT` renderer. Input handling (drag/resize/keyboard,
+//! confirm/cancel wiring) arrives in Plans 03-04.
 
-// Every type/fn below is currently exercised only by this module's own
-// unit tests -- no window/paint/input code calls them yet. Plans 02-04
-// wire real call sites (window creation, wnd_proc, paint) and remove the
-// need for this allowance.
+// Selection-state variants (`Moving`, `Resizing`) and a few geometry helpers
+// have no call site outside tests until Plans 03-04 wire real mouse/keyboard
+// input -- allow dead_code at module level rather than annotate each one.
 #![allow(dead_code)]
 
-use windows::Win32::Foundation::{POINT, RECT};
+use std::ffi::c_void;
+use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
+use windows::core::{Result as WinResult, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    AlphaBlend, BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
+    InvalidateRect, Rectangle, RoundRect, SelectObject, SetBkMode, SetTextColor, AC_SRC_OVER,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DEFAULT_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_SINGLELINE,
+    DT_VCENTER, FF_DONTCARE, FW_NORMAL, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
+};
+#[cfg(debug_assertions)]
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, RegisterClassW,
+    SetForegroundWindow, ShowWindow, CS_DBLCLKS, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+use crate::capture::{self, RawBitmap};
 use crate::constants;
 
 // ---------------------------------------------------------------------
@@ -292,6 +317,530 @@ pub fn readout_text(sel: RECT) -> String {
     let w = sel.right - sel.left;
     let h = sel.bottom - sel.top;
     format!("{w} \u{00D7} {h}")
+}
+
+// ---------------------------------------------------------------------
+// Window lifecycle (REG-01/REG-02, Plan 02 Task 1)
+// ---------------------------------------------------------------------
+
+/// Live state for the currently-open overlay window. GDI handles are stored
+/// as `isize` (toast.rs convention) so the struct can live behind a
+/// `Mutex` without a `Send`/`Sync` fight with raw Win32 handle types.
+struct OverlayData {
+    /// The untouched, saved-pixel source of truth (REG-05): confirm crops
+    /// this, never the DIBs and never a re-capture.
+    frozen: RawBitmap,
+    /// Client rect, origin (0, 0) -- width/height of the monitor.
+    bounds: RECT,
+    /// The monitor's screen-space left/top, kept for reference only.
+    mon_origin: POINT,
+    sel: Option<RECT>,
+    state: OverlayState,
+    closing: bool,
+    awaiting_release: bool,
+    bright_dc: isize,
+    bright_bmp: isize,
+    dim_dc: isize,
+    dim_bmp: isize,
+    back_dc: isize,
+    back_bmp: isize,
+}
+
+/// Process-global handle to the currently-open overlay window, if any.
+/// Cleared by `wnd_proc` on `WM_DESTROY`.
+static OVERLAY_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
+/// Live overlay state, guarded so only the pump thread ever touches it
+/// (mirrors `toast.rs`'s `TOAST_HWND`/`TOAST_TEXT` convention).
+static OVERLAY_DATA: Mutex<Option<OverlayData>> = Mutex::new(None);
+
+/// Guards one-time registration of the overlay window class.
+static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+/// Milliseconds elapsed in the most recent `open()` call, from entry to
+/// `ShowWindow` returning -- read by `--overlay-selftest` (Task 3).
+static LAST_OPEN_MS: Mutex<Option<f64>> = Mutex::new(None);
+
+/// `true` while an overlay window exists (REG-01..06 modality gate for
+/// `app::dispatch`, wired in Plan 03/04).
+pub fn is_active() -> bool {
+    OVERLAY_HWND.lock().unwrap().is_some()
+}
+
+/// Runs `f` with mutable access to the live `OverlayData`, or returns
+/// `None` if no overlay is open. The single seam Plans 03/04 use instead of
+/// locking `OVERLAY_DATA` directly.
+fn with_state<R>(f: impl FnOnce(&mut OverlayData) -> R) -> Option<R> {
+    let mut guard = OVERLAY_DATA.lock().unwrap();
+    guard.as_mut().map(f)
+}
+
+/// Reads back the most recent `open()` timing, in milliseconds. Used by
+/// `--overlay-selftest` (Task 3).
+pub fn last_open_ms() -> Option<f64> {
+    *LAST_OPEN_MS.lock().unwrap()
+}
+
+fn register_class_once() {
+    CLASS_REGISTERED.get_or_init(|| unsafe {
+        let hinstance = GetModuleHandleW(None).expect("GetModuleHandleW failed");
+        let class_name = constants::to_wide(constants::OVERLAY_WINDOW_CLASS);
+        let wc = WNDCLASSW {
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: hinstance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 {
+            panic!("failed to register overlay window class");
+        }
+    });
+}
+
+/// Builds a top-down 32bpp `BI_RGB` DIB section selected into a fresh
+/// compatible DC -- the exact header `capture.rs`'s `capture_via` uses, so
+/// client coords == bitmap coords == frozen-buffer offsets.
+///
+/// Returns `(dc, bitmap, bits_ptr)`; `bits_ptr` points at `width * height *
+/// 4` writable bytes for the duration of the DC/bitmap's lifetime.
+unsafe fn create_dib_dc(width: i32, height: i32) -> WinResult<(isize, isize, *mut c_void)> {
+    let screen_dc = windows::Win32::Graphics::Gdi::GetDC(None);
+    let mem_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+    unsafe { windows::Win32::Graphics::Gdi::ReleaseDC(None, screen_dc) };
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height; // negative => top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+
+    let mut bits_ptr: *mut c_void = std::ptr::null_mut();
+    let dib = match unsafe {
+        CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
+    } {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = unsafe { DeleteDC(mem_dc) };
+            return Err(e);
+        }
+    };
+    unsafe { SelectObject(mem_dc, dib.into()) };
+
+    Ok((mem_dc.0 as isize, dib.0 as isize, bits_ptr))
+}
+
+/// Opens the overlay: freezes the cursor's monitor, composites the bright
+/// and dimmed DIBs plus a back buffer, and creates a focused borderless
+/// topmost popup exactly covering that monitor (REG-01, RESEARCH Pitfall
+/// 3/6). No-op if the overlay is already open.
+pub fn open() {
+    if is_active() {
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // Step 1-2: freeze strictly before any window exists (Pitfall 3) -- the
+    // overlay's own chrome can never end up in the saved pixels.
+    let mon = match capture::monitor_under_cursor() {
+        Ok(m) => m,
+        Err(e) => {
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+    let frozen = match capture::grab(mon) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+
+    let width = mon.right - mon.left;
+    let height = mon.bottom - mon.top;
+
+    register_class_once();
+
+    // Step 5: bright DIB -- a straight copy of the frozen bytes.
+    let (bright_dc, bright_bmp, bright_bits) = match unsafe { create_dib_dc(width, height) } {
+        Ok(v) => v,
+        Err(e) => {
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+    let byte_len = (width as usize) * (height as usize) * 4;
+    unsafe {
+        std::ptr::copy_nonoverlapping(frozen.bgra.as_ptr(), bright_bits as *mut u8, byte_len);
+    }
+
+    // Step 6: dim DIB -- RESEARCH Pitfall 6 fallback: memcpy the frozen
+    // bytes directly into the dim DIB's bits (like the bright DIB above)
+    // instead of an extra full-frame `BitBlt` from bright -> dim; this
+    // trims one 4K-sized GDI blit off the <50 ms critical path. Then darken
+    // with a single `AlphaBlend` of a 1x1 black source stretched over the
+    // whole surface.
+    let (dim_dc, dim_bmp, dim_bits) = match unsafe { create_dib_dc(width, height) } {
+        Ok(v) => v,
+        Err(e) => {
+            free_dc_bmp(bright_dc, bright_bmp);
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(frozen.bgra.as_ptr(), dim_bits as *mut u8, byte_len);
+    }
+    let dim_hdc = windows::Win32::Graphics::Gdi::HDC(dim_dc as *mut c_void);
+    let (black_dc, black_bmp, black_bits) = match unsafe { create_dib_dc(1, 1) } {
+        Ok(v) => v,
+        Err(e) => {
+            free_dc_bmp(bright_dc, bright_bmp);
+            free_dc_bmp(dim_dc, dim_bmp);
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+    unsafe {
+        std::ptr::write_bytes(black_bits as *mut u8, 0, 4);
+    }
+    let black_hdc = windows::Win32::Graphics::Gdi::HDC(black_dc as *mut c_void);
+    let bf = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: constants::OVERLAY_DIM_ALPHA,
+        AlphaFormat: 0,
+    };
+    unsafe {
+        let _ = AlphaBlend(dim_hdc, 0, 0, width, height, black_hdc, 0, 0, 1, 1, bf);
+    }
+    free_dc_bmp(black_dc, black_bmp);
+
+    // Step 7: monitor-sized back buffer used by Task 2's paint.
+    let (back_dc, back_bmp, _back_bits) = match unsafe { create_dib_dc(width, height) } {
+        Ok(v) => v,
+        Err(e) => {
+            free_dc_bmp(bright_dc, bright_bmp);
+            free_dc_bmp(dim_dc, dim_bmp);
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+
+    // Step 8: opaque, topmost, focused popup -- NOT layered, NOT
+    // no-activate (RESEARCH Anti-Patterns / Pitfall 4). mon.left/top may be
+    // negative on a monitor left of primary; pass through unchanged.
+    let hwnd = unsafe {
+        let hinstance = GetModuleHandleW(None).expect("GetModuleHandleW failed");
+        let class_name = constants::to_wide(constants::OVERLAY_WINDOW_CLASS);
+        CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(class_name.as_ptr()),
+            WS_POPUP,
+            mon.left,
+            mon.top,
+            width,
+            height,
+            None,
+            None,
+            Some(hinstance.into()),
+            None,
+        )
+    };
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(e) => {
+            free_dc_bmp(bright_dc, bright_bmp);
+            free_dc_bmp(dim_dc, dim_bmp);
+            free_dc_bmp(back_dc, back_bmp);
+            crate::toast::show(&format!("Capture failed — {e}"));
+            return;
+        }
+    };
+
+    // Step 9: store handles + state before showing, so wnd_proc's first
+    // WM_PAINT (delivered by ShowWindow) has state to render.
+    let bounds = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    *OVERLAY_DATA.lock().unwrap() = Some(OverlayData {
+        frozen,
+        bounds,
+        mon_origin: POINT {
+            x: mon.left,
+            y: mon.top,
+        },
+        sel: None,
+        state: OverlayState::Idle,
+        closing: false,
+        awaiting_release: true,
+        bright_dc,
+        bright_bmp,
+        dim_dc,
+        dim_bmp,
+        back_dc,
+        back_bmp,
+    });
+    *OVERLAY_HWND.lock().unwrap() = Some(hwnd.0 as isize);
+
+    // Step 10: activate with the plain "show" flag (not the toast's
+    // background-only show flag) -- the overlay is the one window that
+    // must take keyboard focus.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+        if GetForegroundWindow() != hwnd {
+            // Not fatal: the WM_ACTIVATE(WA_INACTIVE) guard (Plan 03, D-33)
+            // is the safety net that cancels a never-activated overlay.
+        }
+    }
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    *LAST_OPEN_MS.lock().unwrap() = Some(elapsed_ms);
+    #[cfg(debug_assertions)]
+    {
+        let msg = format!("overlay::open took {elapsed_ms:.2} ms\0");
+        let wide: Vec<u16> = msg.encode_utf16().collect();
+        unsafe { OutputDebugStringW(PCWSTR(wide.as_ptr())) };
+    }
+}
+
+fn free_dc_bmp(dc: isize, bmp: isize) {
+    unsafe {
+        let hdc = windows::Win32::Graphics::Gdi::HDC(dc as *mut c_void);
+        let hbmp = windows::Win32::Graphics::Gdi::HBITMAP(bmp as *mut c_void);
+        let _ = DeleteObject(hbmp.into());
+        let _ = DeleteDC(hdc);
+    }
+}
+
+/// The single cancel funnel every path in Plans 03/04 calls: sets `closing`
+/// then destroys the window. Idempotent-safe against `WM_ACTIVATE`
+/// re-entrancy during teardown (Pitfall 4) -- a second call while already
+/// closing is a no-op.
+fn cancel(hwnd: HWND) {
+    let already_closing = with_state(|d| {
+        let was = d.closing;
+        d.closing = true;
+        was
+    })
+    .unwrap_or(true);
+    if already_closing {
+        return;
+    }
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            unsafe { paint(hwnd) };
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            // Single cleanup point: free every GDI object, drop `frozen`,
+            // clear the statics.
+            let data = OVERLAY_DATA.lock().unwrap().take();
+            if let Some(d) = data {
+                free_dc_bmp(d.back_dc, d.back_bmp);
+                free_dc_bmp(d.dim_dc, d.dim_bmp);
+                free_dc_bmp(d.bright_dc, d.bright_bmp);
+            }
+            *OVERLAY_HWND.lock().unwrap() = None;
+            LRESULT(0)
+        }
+        // wparam/lparam are opaque -- never dereferenced (T-01-04
+        // convention). Everything else falls through unhandled.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+// ---------------------------------------------------------------------
+// Painting (REG-02/REG-03/REG-04, Plan 02 Task 2)
+// ---------------------------------------------------------------------
+
+/// Renders `OverlayData` into the back buffer restricted to `ps.rcPaint`,
+/// then blits the back buffer to the window in one call. Plan 03 only
+/// mutates state and calls `invalidate_change` -- this is the sole place
+/// pixels are produced.
+unsafe fn paint(hwnd: HWND) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+
+    let rendered = with_state(|d| {
+        let back_hdc = windows::Win32::Graphics::Gdi::HDC(d.back_dc as *mut c_void);
+        let dim_hdc = windows::Win32::Graphics::Gdi::HDC(d.dim_dc as *mut c_void);
+        let bright_hdc = windows::Win32::Graphics::Gdi::HDC(d.bright_dc as *mut c_void);
+        let r = ps.rcPaint;
+        let w = r.right - r.left;
+        let h = r.bottom - r.top;
+
+        // 1. Dim background for the dirty region.
+        unsafe {
+            let _ = BitBlt(back_hdc, r.left, r.top, w, h, Some(dim_hdc), r.left, r.top, SRCCOPY);
+        }
+
+        if let Some(sel) = d.sel {
+            // 2. Full-brightness selection interior, intersected with the
+            // dirty region.
+            let ix = intersect_rect(sel, r);
+            if ix.right > ix.left && ix.bottom > ix.top {
+                unsafe {
+                    let _ = BitBlt(
+                        back_hdc,
+                        ix.left,
+                        ix.top,
+                        ix.right - ix.left,
+                        ix.bottom - ix.top,
+                        Some(bright_hdc),
+                        ix.left,
+                        ix.top,
+                        SRCCOPY,
+                    );
+                }
+            }
+
+            // 3. Border stroked on the selection boundary.
+            unsafe {
+                let pen = CreatePen(PS_SOLID, constants::OVERLAY_BORDER_WIDTH, COLORREF(constants::OVERLAY_ACCENT));
+                let old_pen = SelectObject(back_hdc, pen.into());
+                let old_brush = SelectObject(back_hdc, GetStockObject(NULL_BRUSH));
+                let _ = Rectangle(back_hdc, sel.left, sel.top, sel.right, sel.bottom);
+                SelectObject(back_hdc, old_pen);
+                SelectObject(back_hdc, old_brush);
+                let _ = DeleteObject(pen.into());
+            }
+
+            // 4. Filled handle squares.
+            unsafe {
+                let brush = CreateSolidBrush(COLORREF(constants::OVERLAY_ACCENT));
+                for (_, hr) in handle_rects(sel, constants::OVERLAY_HANDLE_SIZE) {
+                    FillRect(back_hdc, &hr, brush);
+                }
+                let _ = DeleteObject(brush.into());
+            }
+
+            // 5. Readout chip.
+            let text = readout_text(sel);
+            let mut wide_text = constants::to_wide(&text);
+            wide_text.pop();
+            let font_name = constants::to_wide("Segoe UI");
+            unsafe {
+                let font = CreateFontW(
+                    constants::OVERLAY_FONT_HEIGHT,
+                    0,
+                    0,
+                    0,
+                    FW_NORMAL.0 as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    DEFAULT_QUALITY,
+                    DEFAULT_PITCH.0 as u32 | FF_DONTCARE.0 as u32,
+                    PCWSTR(font_name.as_ptr()),
+                );
+                let old_font = SelectObject(back_hdc, font.into());
+
+                let mut measure_rect = RECT::default();
+                DrawTextW(back_hdc, &mut wide_text, &mut measure_rect, DT_CALCRECT | DT_SINGLELINE);
+                let chip_w = (measure_rect.right - measure_rect.left) + 2 * constants::OVERLAY_READOUT_PAD_X;
+                let chip_h = (measure_rect.bottom - measure_rect.top) + 2 * constants::OVERLAY_READOUT_PAD_Y;
+                let chip = readout_rect(sel, chip_w, chip_h, d.bounds);
+
+                let chip_brush = CreateSolidBrush(COLORREF(constants::OVERLAY_CHIP_FILL));
+                let old_brush = SelectObject(back_hdc, chip_brush.into());
+                let old_pen2 = SelectObject(back_hdc, GetStockObject(NULL_BRUSH));
+                let _ = RoundRect(
+                    back_hdc,
+                    chip.left,
+                    chip.top,
+                    chip.right,
+                    chip.bottom,
+                    constants::OVERLAY_CHIP_RADIUS * 2,
+                    constants::OVERLAY_CHIP_RADIUS * 2,
+                );
+                SelectObject(back_hdc, old_brush);
+                SelectObject(back_hdc, old_pen2);
+                let _ = DeleteObject(chip_brush.into());
+
+                SetBkMode(back_hdc, TRANSPARENT);
+                SetTextColor(back_hdc, COLORREF(constants::OVERLAY_ACCENT));
+                let mut text_rect = chip;
+                DrawTextW(back_hdc, &mut wide_text, &mut text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+                SelectObject(back_hdc, old_font);
+                let _ = DeleteObject(font.into());
+            }
+        }
+
+        // Single BitBlt from the back buffer to the window for the dirty
+        // region.
+        unsafe {
+            let _ = BitBlt(hdc, r.left, r.top, w, h, Some(back_hdc), r.left, r.top, SRCCOPY);
+        }
+    });
+    let _ = rendered;
+
+    let _ = unsafe { EndPaint(hwnd, &ps) };
+}
+
+fn intersect_rect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    }
+}
+
+/// Computes the dirty union of `old_sel`/`new_sel` (plus their readout
+/// chips) and invalidates exactly that region -- never a full-screen
+/// invalidate on a geometry change (RESEARCH Pattern 6 perf trap). `false`
+/// for erase: the back buffer covers the region and `WM_ERASEBKGND` is
+/// suppressed.
+fn invalidate_change(hwnd: HWND, old_sel: Option<RECT>, new_sel: Option<RECT>) {
+    let bounds = match with_state(|d| d.bounds) {
+        Some(b) => b,
+        None => return,
+    };
+    let pad = constants::OVERLAY_HANDLE_SIZE / 2 + constants::OVERLAY_BORDER_WIDTH + 1;
+    let chip_of = |sel: Option<RECT>| -> RECT {
+        match sel {
+            Some(s) => {
+                let text = readout_text(s);
+                // Conservative fixed-size estimate avoids a GDI text
+                // measurement here; paint() recomputes the exact chip.
+                let approx_w = (text.chars().count() as i32) * constants::OVERLAY_FONT_HEIGHT
+                    + 2 * constants::OVERLAY_READOUT_PAD_X;
+                let approx_h = constants::OVERLAY_FONT_HEIGHT + 2 * constants::OVERLAY_READOUT_PAD_Y;
+                readout_rect(s, approx_w, approx_h, bounds)
+            }
+            None => RECT::default(),
+        }
+    };
+    let old_sel_r = old_sel.unwrap_or_default();
+    let new_sel_r = new_sel.unwrap_or_default();
+    let old_chip = chip_of(old_sel);
+    let new_chip = chip_of(new_sel);
+    let dirty = dirty_union(old_sel_r, old_chip, new_sel_r, new_chip, pad);
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), Some(&dirty), false);
+    }
 }
 
 #[cfg(test)]

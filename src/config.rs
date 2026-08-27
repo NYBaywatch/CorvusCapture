@@ -120,8 +120,11 @@ pub fn config_path() -> PathBuf {
 /// - read succeeds + parse succeeds -> return the parsed config
 /// - read succeeds + parse fails -> toast once per process run, return
 ///   defaults, never touch the user's malformed file
-/// - read fails (missing) -> build defaults, best-effort write them out,
-///   return them
+/// - read fails with `NotFound` -> build defaults, best-effort write them
+///   out, return them
+/// - read fails for any other reason (invalid UTF-8, permission/sharing
+///   error) -> the file EXISTS but is unreadable; treat it like malformed
+///   (toast once, use in-memory defaults) and never write over it
 ///
 /// `jpg_quality` is clamped into 50..=100 on every path.
 pub fn load() -> Config {
@@ -136,12 +139,21 @@ pub fn load() -> Config {
                 Config::default()
             }
         },
-        Err(_) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = Config::default();
             // Best-effort; capture still proceeds on defaults even if this
             // write fails (e.g. a not-yet-existing/unwritable %APPDATA%).
             let _ = save(&cfg);
             cfg
+        }
+        Err(_) => {
+            // Unreadable-but-present file (invalid UTF-8, locked, EACCES):
+            // D-13 forbids touching the user's file -- defaults only, no
+            // write, same once-per-run toast as the malformed-parse path.
+            if MALFORMED_TOASTED.set(()).is_ok() {
+                toast::show("config.json invalid — using defaults");
+            }
+            Config::default()
         }
     };
 

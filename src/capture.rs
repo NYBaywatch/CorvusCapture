@@ -310,7 +310,10 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
 /// new top-down BGRA buffer. The requested rect is clamped to `src`'s
 /// bounds, so a degenerate/misreported window rect can shrink the output
 /// but never read out of bounds.
-fn crop_bitmap(src: &RawBitmap, x: i32, y: i32, width: i32, height: i32) -> RawBitmap {
+///
+/// Public so the Phase 3 region overlay can crop the frozen bitmap at
+/// confirm time (REG-05) -- the overlay never re-captures the screen.
+pub fn crop_bitmap(src: &RawBitmap, x: i32, y: i32, width: i32, height: i32) -> RawBitmap {
     let x = x.clamp(0, src.width);
     let y = y.clamp(0, src.height);
     let width = width.clamp(0, src.width - x);

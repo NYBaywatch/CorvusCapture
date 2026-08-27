@@ -314,10 +314,15 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
 /// Public so the Phase 3 region overlay can crop the frozen bitmap at
 /// confirm time (REG-05) -- the overlay never re-captures the screen.
 pub fn crop_bitmap(src: &RawBitmap, x: i32, y: i32, width: i32, height: i32) -> RawBitmap {
-    let x = x.clamp(0, src.width);
-    let y = y.clamp(0, src.height);
-    let width = width.clamp(0, src.width - x);
-    let height = height.clamp(0, src.height - y);
+    // True rect intersection (WR-02): a negative x/y must SHRINK the output
+    // by the truncated amount, not shift the crop to (0, 0) and return
+    // pixels the caller never requested.
+    let x0 = x.clamp(0, src.width);
+    let y0 = y.clamp(0, src.height);
+    let width = (width - (x0 - x)).clamp(0, src.width - x0);
+    let height = (height - (y0 - y)).clamp(0, src.height - y0);
+    let x = x0;
+    let y = y0;
 
     let src_stride = src.width as usize * 4;
     let row_bytes = width as usize * 4;
@@ -392,9 +397,12 @@ mod tests {
         assert_eq!(out.width, 1);
         assert_eq!(out.height, 1);
         assert_eq!(out.bgra, vec![8u8; 4]);
-        // Negative offsets are clamped to 0.
+        // Negative offsets shrink the crop to the true intersection
+        // (WR-02): requesting 2x2 at (-1, -1) intersects the bitmap in
+        // exactly the 1x1 block at (0, 0).
         let out = crop_bitmap(&src, -1, -1, 2, 2);
-        assert_eq!((out.width, out.height), (2, 2));
+        assert_eq!((out.width, out.height), (1, 1));
+        assert_eq!(out.bgra, vec![0u8; 4]);
     }
 
     #[test]

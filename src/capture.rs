@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors,
@@ -112,7 +112,10 @@ pub fn grab(rect: RECT) -> windows::core::Result<RawBitmap> {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width <= 0 || height <= 0 {
-        return Err(windows::core::Error::from_thread());
+        // Logical failure: no Win32 call failed, so `from_thread()` would
+        // read a stale/successful last-error ("The operation completed
+        // successfully") -- construct an explicit error instead (WR-04).
+        return Err(windows::core::Error::new(E_FAIL, "capture rect is empty"));
     }
 
     unsafe {
@@ -250,7 +253,10 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
             hwnd,
             offscreen,
         } => (*rect, *hwnd, *offscreen),
-        ActiveWindowTarget::None => return Err(windows::core::Error::from_thread()),
+        // Logical failure, not a Win32 one -- explicit error (WR-04).
+        ActiveWindowTarget::None => {
+            return Err(windows::core::Error::new(E_FAIL, "no active window to capture"))
+        }
     };
 
     if !offscreen {
@@ -260,7 +266,8 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width <= 0 || height <= 0 {
-        return Err(windows::core::Error::from_thread());
+        // Logical failure, not a Win32 one -- explicit error (WR-04).
+        return Err(windows::core::Error::new(E_FAIL, "window rect is empty"));
     }
 
     // PrintWindow renders the window at its full `GetWindowRect` geometry
@@ -273,7 +280,8 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
     let win_width = win_rect.right - win_rect.left;
     let win_height = win_rect.bottom - win_rect.top;
     if win_width <= 0 || win_height <= 0 {
-        return Err(windows::core::Error::from_thread());
+        // Logical failure, not a Win32 one -- explicit error (WR-04).
+        return Err(windows::core::Error::new(E_FAIL, "window rect is empty"));
     }
 
     let full = unsafe {

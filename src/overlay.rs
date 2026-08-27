@@ -853,7 +853,17 @@ pub fn hotkey_toggle() {
         return;
     }
 
-    let has_sel = with_state(|d| d.sel.is_some()).unwrap_or(false);
+    // WR-04: never confirm/cancel mid-mouse-drag -- confirming would save a
+    // transient half-finished rectangle (and destroy the window while it
+    // still holds SetCapture). Only the settled Idle/Selected states act.
+    let decision =
+        with_state(|d| (d.sel.is_some(), matches!(d.state, OverlayState::Idle | OverlayState::Selected)));
+    let Some((has_sel, settled)) = decision else {
+        return;
+    };
+    if !settled {
+        return;
+    }
     if has_sel {
         confirm(hwnd);
     } else {
@@ -1230,8 +1240,12 @@ fn on_keydown(hwnd: HWND, vk: VIRTUAL_KEY) {
             }
         }
         VK_RETURN => {
-            let has_sel = with_state(|d| d.sel.is_some()).unwrap_or(false);
-            if has_sel {
+            // WR-04: require the settled state, matching the arrow-key
+            // gate -- confirming mid-mouse-drag would capture a transient
+            // half-finished rectangle while SetCapture is still held.
+            let confirmable = with_state(|d| d.sel.is_some() && d.state == OverlayState::Selected)
+                .unwrap_or(false);
+            if confirmable {
                 confirm(hwnd);
             }
         }

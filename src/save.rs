@@ -365,7 +365,9 @@ pub fn reserve_and_dispatch(
     advisory: Option<String>,
 ) -> Result<(), String> {
     let dir = config::resolve_save_folder(cfg);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Each failure path names its cause so the caller's toast can surface
+    // it verbatim (ERR-02: failures are never silent about their cause).
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't create save folder: {e}"))?;
 
     let base = config::sanitize_base_filename(&cfg.base_filename);
     let format = Format::from_str(&cfg.format);

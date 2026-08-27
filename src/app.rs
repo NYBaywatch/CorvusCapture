@@ -105,10 +105,12 @@ fn run_capture(source: CaptureSource) {
         let _ = clipboard::copy_dib(&bitmap);
     }
 
-    // ERR-01/D-17: a folder-creation failure routes through the existing
-    // Settings dispatch seam -- zero new plumbing.
-    if save::reserve_and_dispatch(bitmap, &cfg, advisory).is_err() {
-        toast::show("Can't create save folder — opening Settings");
+    // ERR-01/D-17: a dispatch failure routes through the existing Settings
+    // dispatch seam -- zero new plumbing. The error text carries the actual
+    // cause (folder creation vs worker init/channel death) so the toast
+    // never blames the save folder for an unrelated failure (ERR-02).
+    if let Err(e) = save::reserve_and_dispatch(bitmap, &cfg, advisory) {
+        toast::show(&format!("Save failed — {e} — opening Settings"));
         dispatch(AppAction::OpenSettings);
     }
 }

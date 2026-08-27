@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetSystemMetrics, PW_RENDERFULLCONTENT,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect, PW_RENDERFULLCONTENT,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
@@ -263,9 +263,22 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
         return Err(windows::core::Error::from_thread());
     }
 
-    unsafe {
+    // PrintWindow renders the window at its full `GetWindowRect` geometry
+    // (which includes the invisible drop-shadow/resize margin), NOT at the
+    // smaller DWM extended-frame-bounds `rect`. Size the DIB from the
+    // window rect, render, then crop to the frame-bounds sub-rect so this
+    // branch yields the same framing as the on-screen BitBlt branch.
+    let mut win_rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut win_rect)? };
+    let win_width = win_rect.right - win_rect.left;
+    let win_height = win_rect.bottom - win_rect.top;
+    if win_width <= 0 || win_height <= 0 {
+        return Err(windows::core::Error::from_thread());
+    }
+
+    let full = unsafe {
         let screen_dc = GetDC(None);
-        let result = capture_via(screen_dc, width, height, |mem_dc| {
+        let result = capture_via(screen_dc, win_width, win_height, |mem_dc| {
             if PrintWindow(hwnd, mem_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool() {
                 Ok(())
             } else {
@@ -274,6 +287,39 @@ pub fn grab_window(target: &ActiveWindowTarget) -> windows::core::Result<RawBitm
         });
         ReleaseDC(None, screen_dc);
         result
+    }?;
+
+    Ok(crop_bitmap(
+        &full,
+        rect.left - win_rect.left,
+        rect.top - win_rect.top,
+        width,
+        height,
+    ))
+}
+
+/// Copies the `width` x `height` sub-rect at `(x, y)` out of `src` into a
+/// new top-down BGRA buffer. The requested rect is clamped to `src`'s
+/// bounds, so a degenerate/misreported window rect can shrink the output
+/// but never read out of bounds.
+fn crop_bitmap(src: &RawBitmap, x: i32, y: i32, width: i32, height: i32) -> RawBitmap {
+    let x = x.clamp(0, src.width);
+    let y = y.clamp(0, src.height);
+    let width = width.clamp(0, src.width - x);
+    let height = height.clamp(0, src.height - y);
+
+    let src_stride = src.width as usize * 4;
+    let row_bytes = width as usize * 4;
+    let mut bgra = Vec::with_capacity(row_bytes * height as usize);
+    for row in y..y + height {
+        let start = row as usize * src_stride + x as usize * 4;
+        bgra.extend_from_slice(&src.bgra[start..start + row_bytes]);
+    }
+
+    RawBitmap {
+        width,
+        height,
+        bgra,
     }
 }
 
@@ -303,6 +349,41 @@ mod tests {
     #[test]
     fn overlapping_rects_intersect() {
         assert!(intersects(rect(0, 0, 10, 10), rect(5, 5, 15, 15)));
+    }
+
+    #[test]
+    fn crop_bitmap_extracts_subrect() {
+        // 3x3 bitmap whose pixels are numbered 0..9 in every channel.
+        let bgra: Vec<u8> = (0u8..9).flat_map(|n| [n; 4]).collect();
+        let src = RawBitmap {
+            width: 3,
+            height: 3,
+            bgra,
+        };
+        // 2x2 crop at (1, 1) -> pixels 4, 5, 7, 8.
+        let out = crop_bitmap(&src, 1, 1, 2, 2);
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        let expected: Vec<u8> = [4u8, 5, 7, 8].iter().flat_map(|n| [*n; 4]).collect();
+        assert_eq!(out.bgra, expected);
+    }
+
+    #[test]
+    fn crop_bitmap_clamps_out_of_bounds_request() {
+        let bgra: Vec<u8> = (0u8..9).flat_map(|n| [n; 4]).collect();
+        let src = RawBitmap {
+            width: 3,
+            height: 3,
+            bgra,
+        };
+        // Requesting past the right/bottom edge shrinks, never panics.
+        let out = crop_bitmap(&src, 2, 2, 5, 5);
+        assert_eq!(out.width, 1);
+        assert_eq!(out.height, 1);
+        assert_eq!(out.bgra, vec![8u8; 4]);
+        // Negative offsets are clamped to 0.
+        let out = crop_bitmap(&src, -1, -1, 2, 2);
+        assert_eq!((out.width, out.height), (2, 2));
     }
 
     #[test]

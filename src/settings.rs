@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, COLOR_BTNFACE,
     HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
@@ -31,19 +32,21 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
     IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK,
+    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK,
     BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
     CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
-    ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL, IDC_ARROW, MSG,
-    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_SETFONT,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL,
+    IDC_ARROW, IDOK, MB_OK, MSG, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
+    WM_HSCROLL, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE,
+    WINDOW_STYLE,
 };
 
 use crate::config::{self, Config, Format};
@@ -524,6 +527,9 @@ fn create_children(hwnd: HWND, dpi: u32, font: HFONT) -> (HashMap<i32, isize>, V
         match spec.id {
             id if id == constants::ID_BASE_EDIT => unsafe {
                 let _ = SendMessageW(child, EM_SETLIMITTEXT, Some(WPARAM(64)), None);
+                // Keystroke filter (D-45, T-04-16): swallows invalid chars
+                // before they render, flicker-free. Removed in WM_DESTROY.
+                let _ = SetWindowSubclass(child, Some(base_edit_subclass), BASE_EDIT_SUBCLASS_ID, 0);
             },
             id if id == constants::ID_FOLDER_EDIT => unsafe {
                 let _ = SendMessageW(child, EM_SETLIMITTEXT, Some(WPARAM(260)), None);
@@ -840,6 +846,32 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) {
             with_state(|d| d.cfg.toast_click_action = action_str.to_string());
             persist();
         }
+        (EN_KILLFOCUS, cid) if cid == constants::ID_BASE_EDIT => {
+            commit_base_filename(hwnd);
+        }
+        (EN_KILLFOCUS, cid) if cid == constants::ID_FOLDER_EDIT => {
+            commit_folder(hwnd);
+        }
+        (EN_CHANGE, cid) if cid == constants::ID_BASE_EDIT => {
+            sweep_base_filename(hwnd);
+        }
+        _ if id == IDOK.0 => {
+            // Enter (via IsDialogMessageW): commit whichever edit has
+            // focus. Never closes the window, never "clicks" Browse
+            // (Pitfall 2 -- no BS_DEFPUSHBUTTON exists to steal this).
+            let focused = unsafe { GetFocus() };
+            if let Ok(base_edit) = unsafe { GetDlgItem(Some(hwnd), constants::ID_BASE_EDIT) } {
+                if focused == base_edit {
+                    commit_base_filename(hwnd);
+                    return;
+                }
+            }
+            if let Ok(folder_edit) = unsafe { GetDlgItem(Some(hwnd), constants::ID_FOLDER_EDIT) } {
+                if focused == folder_edit {
+                    commit_folder(hwnd);
+                }
+            }
+        }
         _ if id == IDCANCEL.0 => {
             close(hwnd);
         }
@@ -870,13 +902,163 @@ fn handle_hscroll(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
 }
 
 // ---------------------------------------------------------------------
+// Hints (D-45..D-48): one STATIC per field, a per-hint SetTimer/WM_TIMER
+// pair reusing TOAST_DURATION_MS-equivalent timing (SETTINGS_HINT_MS).
+// ---------------------------------------------------------------------
+
+/// Sets the hint static addressed by `id` to `text` and (re)starts its
+/// auto-clear timer. Re-showing a hint while its timer is already running
+/// restarts the timer (`SetTimer` on an existing id replaces it).
+fn show_hint(hwnd: HWND, id: i32, text: &str) {
+    set_text(hwnd, id, text);
+    unsafe {
+        let _ = SetTimer(
+            Some(hwnd),
+            constants::SETTINGS_HINT_TIMER_BASE + id as usize,
+            constants::SETTINGS_HINT_MS,
+            None,
+        );
+    }
+}
+
+/// `MessageBeep(MB_OK)` plus the filename hint (D-45 copy, verbatim).
+/// Reads the process-global Settings HWND rather than taking a parameter,
+/// so both the `WM_CHAR` subclass (whose own `hwnd` is the edit, not the
+/// parent) and the `EN_CHANGE` sweep can share one implementation.
+fn reject_feedback() {
+    unsafe {
+        let _ = MessageBeep(MB_OK);
+    }
+    if let Some(hwnd) = current_hwnd() {
+        show_hint(
+            hwnd,
+            constants::ID_BASE_HINT,
+            "Not allowed: \\ / : * ? \" < > | .",
+        );
+    }
+}
+
+/// Unique id passed to `SetWindowSubclass`/`RemoveWindowSubclass` for the
+/// base filename edit's keystroke filter (Pattern 7).
+const BASE_EDIT_SUBCLASS_ID: usize = 1;
+
+/// `WM_CHAR` subclass on the base filename edit (D-45, T-04-16): blocks
+/// only printable invalid characters before they are ever inserted.
+/// Control characters (Backspace, Ctrl+A/C/V/X/Z) always pass through --
+/// `is_control()` is checked first -- so editing shortcuts keep working.
+unsafe extern "system" fn base_edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref: usize,
+) -> LRESULT {
+    if msg == WM_CHAR {
+        if let Some(c) = char::from_u32(wparam.0 as u32) {
+            if !c.is_control() && config::is_invalid_filename_char(c) {
+                reject_feedback();
+                return LRESULT(0);
+            }
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+/// `EN_CHANGE` sweep (T-04-17): covers paste, drag-drop, and IME
+/// composition, none of which are seen by the `WM_CHAR` subclass. Never
+/// writes config -- D-37 reserves that for commit (kill-focus/Enter/close).
+fn sweep_base_filename(hwnd: HWND) {
+    let text = read_text(hwnd, constants::ID_BASE_EDIT);
+    if text.chars().all(|c| !config::is_invalid_filename_char(c)) {
+        return;
+    }
+    let filtered: String = text
+        .chars()
+        .filter(|c| !config::is_invalid_filename_char(*c))
+        .collect();
+    set_text(hwnd, constants::ID_BASE_EDIT, &filtered);
+    if let Ok(edit) = unsafe { GetDlgItem(Some(hwnd), constants::ID_BASE_EDIT) } {
+        let len = unsafe { GetWindowTextLengthW(edit) };
+        unsafe {
+            let _ = SendMessageW(
+                edit,
+                EM_SETSEL,
+                Some(WPARAM(len.max(0) as usize)),
+                Some(LPARAM(len as isize)),
+            );
+        }
+    }
+    reject_feedback();
+}
+
+/// Commits the base filename edit (`EN_KILLFOCUS`, `IDOK` while focused,
+/// or the close path): empty/whitespace-only reverts to `last_base` with a
+/// hint and does not persist (D-46 -- `corvus` is never substituted here).
+/// Interior whitespace is preserved, matching `sanitize_base_filename`.
+fn commit_base_filename(hwnd: HWND) {
+    let text = read_text(hwnd, constants::ID_BASE_EDIT);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        let last = with_state(|d| d.last_base.clone()).unwrap_or_default();
+        set_text(hwnd, constants::ID_BASE_EDIT, &last);
+        show_hint(hwnd, constants::ID_BASE_HINT, "Name can't be empty");
+        return;
+    }
+    let trimmed = trimmed.to_string();
+    with_state(|d| {
+        d.cfg.base_filename = trimmed.clone();
+        d.last_base = trimmed.clone();
+    });
+    persist();
+    if let Some(cfg) = with_state(|d| d.cfg.clone()) {
+        refresh_preview(hwnd, &cfg);
+    }
+}
+
+/// Commits the save folder edit (`EN_KILLFOCUS`, `IDOK` while focused, or
+/// the close path). Rejects on the same rules `config::validate_save_folder`
+/// enforces, then probes creatability; config.json is never written with a
+/// path that failed either check (D-47/D-48).
+fn commit_folder(hwnd: HWND) {
+    let text = read_text(hwnd, constants::ID_FOLDER_EDIT);
+    let trimmed = text.trim();
+    let revert = |hwnd: HWND, msg: &str| {
+        let last = with_state(|d| d.last_folder.clone()).unwrap_or_default();
+        set_text(hwnd, constants::ID_FOLDER_EDIT, &last);
+        show_hint(hwnd, constants::ID_FOLDER_HINT, msg);
+    };
+    let path = match config::validate_save_folder(trimmed) {
+        Ok(path) => path,
+        Err(e) => {
+            revert(hwnd, &e.to_string());
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        revert(hwnd, &format!("Couldn't create folder: {e}"));
+        return;
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    with_state(|d| {
+        d.cfg.save_folder = path_str.clone();
+        d.last_folder = path_str.clone();
+    });
+    persist();
+    if let Some(cfg) = with_state(|d| d.cfg.clone()) {
+        refresh_preview(hwnd, &cfg);
+    }
+}
+
+// ---------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------
 
-/// The single cancel/close funnel: sets `closing` then destroys the
-/// window. Idempotent -- a second call while already closing is a no-op
-/// (overlay.rs Pitfall 3 shape). Committing uncommitted edits before
-/// `DestroyWindow` is added in plan 04-04.
+/// The single cancel/close funnel: sets `closing` then commits both edits
+/// (Pitfall 3 -- `WM_COMMAND` dispatch is gated on `!closing`, so no
+/// `EN_KILLFOCUS` fired by the coming `DestroyWindow` can double-commit or
+/// flash a hint) before destroying the window. Idempotent -- a second call
+/// while already closing is a no-op.
 fn close(hwnd: HWND) {
     let already_closing = with_state(|d| {
         let was = d.closing;
@@ -887,6 +1069,8 @@ fn close(hwnd: HWND) {
     if already_closing {
         return;
     }
+    commit_base_filename(hwnd);
+    commit_folder(hwnd);
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
@@ -993,6 +1177,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            let timer_id = wparam.0;
+            for id in [
+                constants::ID_BASE_HINT,
+                constants::ID_FOLDER_HINT,
+                constants::ID_STARTUP_HINT,
+            ] {
+                if timer_id == constants::SETTINGS_HINT_TIMER_BASE + id as usize {
+                    set_text(hwnd, id, "");
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), timer_id);
+                    }
+                    break;
+                }
+            }
+            LRESULT(0)
+        }
         WM_DPICHANGED => {
             let new_dpi = (wparam.0 >> 16) as u32;
             let new_font = message_font_for_dpi(new_dpi);
@@ -1039,8 +1240,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_DESTROY => {
-            // Single cleanup point (Pitfall 10): free the font, kill any
-            // pending hint timers, clear the process-global HWND.
+            // Single cleanup point (Pitfall 10): remove the keystroke
+            // filter subclass, free the font, kill any pending hint
+            // timers, clear the process-global HWND.
+            if let Ok(base_edit) = unsafe { GetDlgItem(Some(hwnd), constants::ID_BASE_EDIT) } {
+                unsafe {
+                    let _ = RemoveWindowSubclass(
+                        base_edit,
+                        Some(base_edit_subclass),
+                        BASE_EDIT_SUBCLASS_ID,
+                    );
+                }
+            }
             let data = SETTINGS_DATA.lock().unwrap().take();
             if let Some(d) = data {
                 if d.font != 0 {

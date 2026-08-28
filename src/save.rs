@@ -137,6 +137,22 @@ impl Counter {
             }
         }
     }
+
+    /// Read-only counterpart of `next`: returns the same number `next`
+    /// would, without mutating `highest_seen` (D-49 preview).
+    ///
+    /// Not yet consumed outside tests: the Settings window preview is a
+    /// later Phase 4 plan.
+    #[allow(dead_code)]
+    fn peek(&self, ext: &str) -> u32 {
+        let mut n = self.highest_seen;
+        loop {
+            n += 1;
+            if !self.dir.join(filename_for(&self.base, n, ext)).exists() {
+                return n;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -345,6 +361,31 @@ fn encode_and_write(job: SaveJob) -> Result<String, String> {
     }
 
     Ok(final_file_name)
+}
+
+/// Reports the exact file name the next capture would create, using the
+/// same `COUNTER` instance as a real reservation (so preview and reservation
+/// can never disagree), without consuming a number (D-49). Mirrors
+/// `reserve_and_dispatch`'s resolution prologue step for step. Returns the
+/// bare file name only -- the "Next: " prefix is the UI's job. Does not
+/// create the save folder and does not dispatch a job.
+///
+/// Not yet consumed outside tests: the Settings window preview is a later
+/// Phase 4 plan.
+#[allow(dead_code)]
+pub fn peek_next_filename(cfg: &Config) -> String {
+    let dir = config::resolve_save_folder(cfg);
+    let base = config::sanitize_base_filename(&cfg.base_filename);
+    let ext = Format::from_str(&cfg.format).ext();
+
+    let n = {
+        let mut guard = COUNTER.lock().unwrap();
+        let counter = guard.get_or_insert_with(Counter::default);
+        counter.set_target(&dir, &base);
+        counter.peek(ext)
+    };
+
+    filename_for(&base, n, ext)
 }
 
 /// Drains the oldest pending `SaveOutcome`, if any, for the wnd_proc arm

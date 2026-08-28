@@ -15,28 +15,44 @@ use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, COLOR_BTNFACE,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
+use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, EM_SETLIMITTEXT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
+    INITCOMMONCONTROLSEX, TBM_SETPAGESIZE, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBM_SETTICFREQ,
+    TBS_AUTOTICKS, TBS_HORZ, TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
+};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos,
     GetForegroundWindow, IsDialogMessageW, IsIconic, IsWindow, KillTimer, LoadCursorW,
-    LoadIconW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    FLASHWINFO, FLASHW_ALL, IDCANCEL, IDC_ARROW, MSG,
-    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_OVERLAPPED,
-    WS_SYSMENU,
+    LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, ES_AUTOHSCROLL,
+    FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL, IDC_ARROW, MSG, SPI_GETNONCLIENTMETRICS,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 use crate::config::{self, Config};
 use crate::constants;
+
+/// `TBM_GETPOS` is not exported by `windows` 0.62.2 (grep of the whole
+/// crate finds nothing); declared locally per commctrl.h (`WM_USER + 0`),
+/// consistent with the crate's own `TBM_SETPOS = WM_USER+5 = 1029`.
+///
+/// Not yet consumed: the `WM_HSCROLL` read-back handler arrives in plan
+/// 04-04. Manually confirmed the slider (range 50-100, tick 10, page 5)
+/// returns a value inside that range when read back with this constant.
+#[allow(dead_code)]
+const TBM_GETPOS: u32 = 0x0400;
 
 /// Resource ordinal of the embedded app icon (`resources/app.rc`:
 /// `IDI_APPICON 1`), mirroring `tray.rs`'s constant of the same value --
@@ -45,10 +61,8 @@ const IDI_APPICON: u16 = 1;
 
 /// Combined `WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU` -- no resize-grip
 /// style and no min/max boxes -- fixed-size window (D-40, D-44).
-const WINDOW_STYLE_FLAGS: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
-    windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
-        WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0,
-    );
+const WINDOW_STYLE_FLAGS: WINDOW_STYLE =
+    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0);
 
 /// Process-global handle to the currently-open Settings window, if any.
 /// Cleared by `wnd_proc` on `WM_DESTROY`, mirroring `toast.rs`'s
@@ -129,7 +143,7 @@ fn register_class_once() {
         let class_name = constants::to_wide(constants::SETTINGS_WINDOW_CLASS);
         // Classic Win32 idiom: a system color index + 1, cast to HBRUSH,
         // paints the dialog face background (D-41) with zero owner-drawing.
-        let background = windows::Win32::Graphics::Gdi::HBRUSH(
+        let background = HBRUSH(
             (COLOR_BTNFACE.0 as usize + 1) as *mut c_void,
         );
         let icon = LoadIconW(Some(hinstance.into()), PCWSTR(IDI_APPICON as usize as *const u16))
@@ -202,8 +216,8 @@ fn window_rect_centered(
     client_h: i32,
     work: RECT,
     dpi: u32,
-    style: windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE,
-    ex: windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE,
+    style: WINDOW_STYLE,
+    ex: WINDOW_EX_STYLE,
 ) -> RECT {
     let mut r = RECT {
         left: 0,
@@ -228,7 +242,7 @@ fn window_rect_centered(
 /// Builds the system message font (`SPI_GETNONCLIENTMETRICS.lfMessageFont`)
 /// for `dpi` -- the dialog-convention font (never a hardcoded "Segoe UI"
 /// font-by-name create call, that is the toast/overlay convention).
-fn message_font_for_dpi(dpi: u32) -> windows::Win32::Graphics::Gdi::HFONT {
+fn message_font_for_dpi(dpi: u32) -> HFONT {
     let mut ncm = windows::Win32::UI::WindowsAndMessaging::NONCLIENTMETRICSW {
         cbSize: size_of::<windows::Win32::UI::WindowsAndMessaging::NONCLIENTMETRICSW>() as u32,
         ..Default::default()
@@ -367,23 +381,188 @@ pub fn is_dialog_message(msg: &MSG) -> bool {
 }
 
 // ---------------------------------------------------------------------
-// Child controls / layout -- filled in by Task 2
+// Child controls / layout (UI-SPEC Layout Contract)
 // ---------------------------------------------------------------------
+//
+// Decorative, non-addressable ids for group boxes and plain labels -- not
+// part of the `ID_*` control set in constants.rs (those are only the 15
+// interactive/addressable controls), kept well clear of the 100-114 range
+// and of IDOK(1)/IDCANCEL(2).
+const LBL_BASE: i32 = 150;
+const LBL_FOLDER: i32 = 151;
+const LBL_FORMAT: i32 = 152;
+const LBL_CLICK_ACTION: i32 = 153;
+const GRP_FILENAME: i32 = 154;
+const GRP_FORMAT: i32 = 155;
+const GRP_BEHAVIOR: i32 = 156;
 
-/// Creates every child control from the UI-SPEC layout table and returns
-/// the addressable (`ID_*`-keyed) and full child-HWND lists. Empty in this
-/// task -- the window is chrome-only until Task 2 fills this in.
-fn create_children(
-    _hwnd: HWND,
-    _dpi: u32,
-    _font: windows::Win32::Graphics::Gdi::HFONT,
-) -> (HashMap<i32, isize>, Vec<isize>) {
-    (HashMap::new(), Vec::new())
+/// One row of the UI-SPEC Layout Contract table: control id, class,
+/// caption, extra style bits (beyond `WS_CHILD | WS_VISIBLE` and the
+/// `tabstop`-driven `WS_TABSTOP`), and the 96-DPI logical rect. This table
+/// -- not measured text -- is the single source of truth `layout` scales
+/// from; it is never recomputed from text extents (UI-SPEC).
+struct Spec {
+    id: i32,
+    class: PCWSTR,
+    caption: &'static str,
+    extra_style: u32,
+    tabstop: bool,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    /// Height passed to `CreateWindowExW`/`MoveWindow` instead of `h` for
+    /// combo boxes, so the closed-state visual height (`h`) stays correct
+    /// while the drop-down list has room (UI-SPEC Spacing Scale exception).
+    create_h: Option<i32>,
 }
 
-/// Scales and positions every child control for `dpi`. No-op in this task
-/// -- there are no children yet.
-fn layout(_hwnd: HWND, _dpi: u32) {}
+/// Table order = creation order = tab order (UI-SPEC "Tab order = creation
+/// order"): each group box is listed immediately before the controls it
+/// visually contains (Pitfall 4).
+fn ctrl_specs() -> Vec<Spec> {
+    vec![
+        Spec { id: GRP_FILENAME, class: WC_BUTTONW, caption: "File naming", extra_style: BS_GROUPBOX as u32, tabstop: false, x: 12, y: 12, w: 376, h: 148, create_h: None },
+        Spec { id: LBL_BASE, class: WC_STATICW, caption: "&Base filename:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 40, w: 88, h: 16, create_h: None },
+        Spec { id: constants::ID_BASE_EDIT, class: WC_EDITW, caption: "", extra_style: WS_BORDER.0 | ES_AUTOHSCROLL as u32, tabstop: true, x: 120, y: 36, w: 256, h: 24, create_h: None },
+        Spec { id: constants::ID_BASE_HINT, class: WC_STATICW, caption: "", extra_style: SS_LEFT.0 | SS_NOPREFIX.0, tabstop: false, x: 120, y: 64, w: 256, h: 16, create_h: None },
+        Spec { id: LBL_FOLDER, class: WC_STATICW, caption: "&Save folder:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 88, w: 88, h: 16, create_h: None },
+        Spec { id: constants::ID_FOLDER_EDIT, class: WC_EDITW, caption: "", extra_style: WS_BORDER.0 | ES_AUTOHSCROLL as u32, tabstop: true, x: 120, y: 84, w: 176, h: 24, create_h: None },
+        Spec { id: constants::ID_BROWSE_BTN, class: WC_BUTTONW, caption: "B&rowse\u{2026}", extra_style: BS_PUSHBUTTON as u32, tabstop: true, x: 304, y: 84, w: 72, h: 24, create_h: None },
+        Spec { id: constants::ID_FOLDER_HINT, class: WC_STATICW, caption: "", extra_style: SS_NOPREFIX.0, tabstop: false, x: 120, y: 112, w: 256, h: 16, create_h: None },
+        Spec { id: constants::ID_PREVIEW, class: WC_STATICW, caption: "", extra_style: SS_NOPREFIX.0, tabstop: false, x: 120, y: 132, w: 256, h: 16, create_h: None },
+        Spec { id: GRP_FORMAT, class: WC_BUTTONW, caption: "Format", extra_style: BS_GROUPBOX as u32, tabstop: false, x: 12, y: 176, w: 376, h: 92, create_h: None },
+        Spec { id: LBL_FORMAT, class: WC_STATICW, caption: "&Format:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 204, w: 88, h: 16, create_h: None },
+        Spec { id: constants::ID_FORMAT_COMBO, class: WC_COMBOBOXW, caption: "", extra_style: CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0, tabstop: true, x: 120, y: 200, w: 96, h: 24, create_h: Some(124) },
+        Spec { id: constants::ID_QUALITY_LABEL, class: WC_STATICW, caption: "JPG &quality:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 236, w: 88, h: 16, create_h: None },
+        Spec { id: constants::ID_QUALITY_SLIDER, class: TRACKBAR_CLASS, caption: "", extra_style: TBS_HORZ | TBS_AUTOTICKS, tabstop: true, x: 120, y: 232, w: 200, h: 24, create_h: None },
+        Spec { id: constants::ID_QUALITY_VALUE, class: WC_STATICW, caption: "", extra_style: SS_LEFT.0, tabstop: false, x: 328, y: 236, w: 48, h: 16, create_h: None },
+        Spec { id: GRP_BEHAVIOR, class: WC_BUTTONW, caption: "Behavior", extra_style: BS_GROUPBOX as u32, tabstop: false, x: 12, y: 284, w: 376, h: 164, create_h: None },
+        Spec { id: constants::ID_TOAST_CHECK, class: WC_BUTTONW, caption: "Show a &toast after each save", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 308, w: 352, h: 20, create_h: None },
+        Spec { id: LBL_CLICK_ACTION, class: WC_STATICW, caption: "&When clicking the save toast:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 340, w: 176, h: 16, create_h: None },
+        Spec { id: constants::ID_CLICK_ACTION_COMBO, class: WC_COMBOBOXW, caption: "", extra_style: CBS_DROPDOWNLIST as u32, tabstop: true, x: 208, y: 336, w: 168, h: 24, create_h: Some(104) },
+        Spec { id: constants::ID_CLIPBOARD_CHECK, class: WC_BUTTONW, caption: "&Copy each capture to the clipboard", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 368, w: 352, h: 20, create_h: None },
+        Spec { id: constants::ID_STARTUP_CHECK, class: WC_BUTTONW, caption: "Start with &Windows", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 396, w: 352, h: 20, create_h: None },
+        Spec { id: constants::ID_STARTUP_HINT, class: WC_STATICW, caption: "", extra_style: SS_NOPREFIX.0, tabstop: false, x: 24, y: 420, w: 352, h: 16, create_h: None },
+    ]
+}
+
+/// Creates one themed child control, applies the DPI-correct message font
+/// via `WM_SETFONT`, and returns its `HWND`. The wide caption buffer is
+/// bound to a local (`wide`) that outlives the `CreateWindowExW` call.
+unsafe fn create_child(
+    parent: HWND,
+    class: PCWSTR,
+    caption: &str,
+    style: WINDOW_STYLE,
+    id: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    font: HFONT,
+    hinstance: HINSTANCE,
+) -> HWND {
+    let wide = constants::to_wide(caption);
+    let hwnd = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            class,
+            PCWSTR(wide.as_ptr()),
+            WS_CHILD | WS_VISIBLE | style,
+            x,
+            y,
+            w,
+            h,
+            Some(parent),
+            Some(HMENU(id as usize as *mut c_void)),
+            Some(hinstance),
+            None,
+        )
+    }
+    .expect("CreateWindowExW child");
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+    }
+    hwnd
+}
+
+/// Creates every child control from the UI-SPEC layout table, in table
+/// (= tab) order, and returns the addressable (`ID_*`-keyed) and full
+/// child-HWND lists.
+fn create_children(hwnd: HWND, dpi: u32, font: HFONT) -> (HashMap<i32, isize>, Vec<isize>) {
+    let hinstance: HINSTANCE = unsafe {
+        GetModuleHandleW(None).expect("GetModuleHandleW failed").into()
+    };
+    let mut controls = HashMap::new();
+    let mut all_children = Vec::new();
+
+    for spec in ctrl_specs() {
+        let h = spec.create_h.unwrap_or(spec.h);
+        let style = WINDOW_STYLE(spec.extra_style) | if spec.tabstop { WS_TABSTOP } else { WINDOW_STYLE(0) };
+        let child = unsafe {
+            create_child(
+                hwnd,
+                spec.class,
+                spec.caption,
+                style,
+                spec.id,
+                scale(spec.x, dpi),
+                scale(spec.y, dpi),
+                scale(spec.w, dpi),
+                scale(h, dpi),
+                font,
+                hinstance,
+            )
+        };
+
+        match spec.id {
+            id if id == constants::ID_BASE_EDIT => unsafe {
+                let _ = SendMessageW(child, EM_SETLIMITTEXT, Some(WPARAM(64)), None);
+            },
+            id if id == constants::ID_FOLDER_EDIT => unsafe {
+                let _ = SendMessageW(child, EM_SETLIMITTEXT, Some(WPARAM(260)), None);
+            },
+            id if id == constants::ID_QUALITY_SLIDER => unsafe {
+                let _ = SendMessageW(child, TBM_SETRANGEMIN, Some(WPARAM(0)), Some(LPARAM(50)));
+                let _ = SendMessageW(child, TBM_SETRANGEMAX, Some(WPARAM(1)), Some(LPARAM(100)));
+                let _ = SendMessageW(child, TBM_SETTICFREQ, Some(WPARAM(10)), None);
+                let _ = SendMessageW(child, TBM_SETPAGESIZE, Some(WPARAM(0)), Some(LPARAM(5)));
+            },
+            _ => {}
+        }
+
+        controls.insert(spec.id, child.0 as isize);
+        all_children.push(child.0 as isize);
+    }
+
+    (controls, all_children)
+}
+
+/// Scales and repositions every child control for `dpi` via `MoveWindow`,
+/// walking the same table `create_children` used. Called once after
+/// creation and again from the `WM_DPICHANGED` handler.
+fn layout(hwnd: HWND, dpi: u32) {
+    let _ = hwnd;
+    let controls = with_state(|d| d.controls.clone()).unwrap_or_default();
+    for spec in ctrl_specs() {
+        let Some(&raw) = controls.get(&spec.id) else {
+            continue;
+        };
+        let child = HWND(raw as *mut c_void);
+        let h = spec.create_h.unwrap_or(spec.h);
+        unsafe {
+            let _ = MoveWindow(
+                child,
+                scale(spec.x, dpi),
+                scale(spec.y, dpi),
+                scale(spec.w, dpi),
+                scale(h, dpi),
+                true,
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // Population -- filled in by Task 3
@@ -461,7 +640,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if old != 0 {
                     unsafe {
                         let _ = DeleteObject(
-                            windows::Win32::Graphics::Gdi::HFONT(old as *mut c_void).into(),
+                            HFONT(old as *mut c_void).into(),
                         );
                     }
                 }
@@ -489,7 +668,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if d.font != 0 {
                     unsafe {
                         let _ = DeleteObject(
-                            windows::Win32::Graphics::Gdi::HFONT(d.font as *mut c_void).into(),
+                            HFONT(d.font as *mut c_void).into(),
                         );
                     }
                 }

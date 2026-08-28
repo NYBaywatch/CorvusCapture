@@ -218,6 +218,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_invalid_filename_char_matches_sanitizer_set() {
+        for c in INVALID_FILENAME_CHARS {
+            assert!(is_invalid_filename_char(*c), "{c:?} should be invalid");
+        }
+        assert!(is_invalid_filename_char('.'));
+        assert!(is_invalid_filename_char('\u{1f}'));
+        assert!(!is_invalid_filename_char('a'));
+        assert!(!is_invalid_filename_char(' '));
+        assert!(!is_invalid_filename_char('-'));
+        assert!(!is_invalid_filename_char('_'));
+    }
+
+    #[test]
+    fn start_with_windows_missing_key_deserializes_false() {
+        let json = r#"{"version":1,"base_filename":"corvus"}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.start_with_windows);
+        assert_eq!(cfg.version, 1);
+    }
+
+    #[test]
+    fn validate_save_folder_rejects_empty() {
+        assert!(matches!(
+            validate_save_folder(""),
+            Err(FolderError::NotAbsolute)
+        ));
+    }
+
+    #[test]
+    fn validate_save_folder_rejects_relative() {
+        assert!(matches!(
+            validate_save_folder("relative\\path"),
+            Err(FolderError::NotAbsolute)
+        ));
+    }
+
+    #[test]
+    fn validate_save_folder_rejects_parent_traversal() {
+        let raw = format!(
+            "{}\\..\\evil",
+            constants::default_capture_dir().to_string_lossy()
+        );
+        assert!(matches!(
+            validate_save_folder(&raw),
+            Err(FolderError::ParentTraversal)
+        ));
+    }
+
+    #[test]
+    fn validate_save_folder_accepts_absolute_clean_path() {
+        let raw = "C:\\Users\\Someone\\Pictures\\CorvusCapture";
+        let result = validate_save_folder(raw).unwrap();
+        assert_eq!(result, PathBuf::from(raw));
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_left_behind_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!(
+            "corvus_config_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let tmp_path = dir.join("config.json.tmp");
+
+        let cfg = Config::default();
+        save_to(&cfg, &path, &tmp_path).unwrap();
+
+        assert!(!tmp_path.exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let roundtripped: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(roundtripped.base_filename, cfg.base_filename);
+        assert_eq!(roundtripped.save_folder, cfg.save_folder);
+        assert_eq!(roundtripped.start_with_windows, cfg.start_with_windows);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sanitize_plain_name_unchanged() {
         assert_eq!(sanitize_base_filename("corvus"), "corvus");
     }
@@ -265,6 +348,7 @@ mod tests {
         assert!(!cfg.clipboard_enabled);
         assert_eq!(ClickAction::from_str(&cfg.toast_click_action), ClickAction::Dismiss);
         assert_eq!(cfg.version, 1);
+        assert!(!cfg.start_with_windows);
     }
 
     #[test]

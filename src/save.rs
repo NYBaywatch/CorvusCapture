@@ -420,6 +420,30 @@ mod tests {
     }
 
     #[test]
+    fn peek_matches_next_and_is_idempotent() {
+        let dir = temp_test_dir();
+        std::fs::write(dir.join("corvus001.png"), b"x").unwrap();
+        std::fs::write(dir.join("corvus007.png"), b"x").unwrap();
+        let mut counter = Counter::default();
+        counter.set_target(&dir, "corvus");
+        let first_peek = counter.peek("png");
+        let second_peek = counter.peek("png");
+        assert_eq!(first_peek, 8);
+        assert_eq!(second_peek, 8);
+        assert_eq!(counter.next("png"), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_next_filename_on_fresh_dir_returns_corvus001() {
+        let dir = temp_test_dir();
+        let mut cfg = Config::default();
+        cfg.save_folder = dir.to_string_lossy().into_owned();
+        assert_eq!(peek_next_filename(&cfg), "corvus001.png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn filename_for_basic() {
         assert_eq!(filename_for("corvus", 4, "png"), "corvus004.png");
     }

@@ -19,6 +19,10 @@ use windows::Win32::System::Registry::{
 use crate::constants;
 
 const RUN_SUBKEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+
+/// Not yet consumed outside `is_registered`/`set_enabled`, reachable from
+/// the Settings checkbox in plan 04-04.
+#[allow(dead_code)]
 const STARTUP_APPROVED_SUBKEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run");
 
@@ -124,6 +128,9 @@ pub fn write_command(cmd: &str) -> Result<(), windows::core::Error> {
 
 /// Deletes the Run value for this app. Succeeds silently when the value or
 /// key was already absent. Minimal SAM rights: `KEY_SET_VALUE`.
+///
+/// Not yet consumed: reachable from the Settings checkbox in plan 04-04.
+#[allow(dead_code)]
 pub fn delete_command() -> Result<(), windows::core::Error> {
     unsafe {
         let mut hkey = HKEY::default();
@@ -153,6 +160,10 @@ pub fn delete_command() -> Result<(), windows::core::Error> {
 /// (enabled) or `0x03` (disabled). A read failure (key/value absent) is
 /// treated as "not disabled" — the common case where Task Manager was
 /// never used to touch this entry.
+///
+/// Not yet consumed: reachable from `is_registered`, wired to the Settings
+/// checkbox in plan 04-04.
+#[allow(dead_code)]
 fn is_task_manager_disabled() -> bool {
     unsafe {
         let mut len: u32 = 0;
@@ -190,6 +201,9 @@ fn is_task_manager_disabled() -> bool {
 /// True only when the Run value matches this exe AND the entry has not
 /// been disabled via Task Manager's Startup tab (D-51 — the state reported
 /// to the UI is derived from the registry, not from the config flag).
+///
+/// Not yet consumed: wired to the Settings checkbox state in plan 04-04.
+#[allow(dead_code)]
 pub fn is_registered() -> bool {
     match (read_command(), desired_command()) {
         (Some(r), Ok(d)) => commands_match(&r, &d) && !is_task_manager_disabled(),
@@ -202,6 +216,9 @@ pub fn is_registered() -> bool {
 /// Task-Manager "Disable" does not silently defeat this toggle); a failure
 /// deleting the `StartupApproved` value is ignored. On disable, deletes
 /// only the Run value — `StartupApproved` is left untouched.
+///
+/// Not yet consumed: wired to the Settings checkbox toggle in plan 04-04.
+#[allow(dead_code)]
 pub fn set_enabled(enabled: bool) -> Result<(), windows::core::Error> {
     if enabled {
         let cmd = desired_command().map_err(|e| {
@@ -218,6 +235,9 @@ pub fn set_enabled(enabled: bool) -> Result<(), windows::core::Error> {
 /// Deletes the `StartupApproved\Run` value for this app, if present.
 /// Errors (including "already absent") are the caller's to ignore per
 /// `set_enabled`'s contract.
+///
+/// Not yet consumed: called from `set_enabled`, wired in plan 04-04.
+#[allow(dead_code)]
 fn delete_startup_approved() -> Result<(), windows::core::Error> {
     unsafe {
         let mut hkey = HKEY::default();

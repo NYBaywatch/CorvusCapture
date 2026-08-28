@@ -90,6 +90,7 @@ pub struct Config {
     pub toast_enabled: bool,
     pub clipboard_enabled: bool,
     pub toast_click_action: String,
+    pub start_with_windows: bool, // D-50/D-51
 }
 
 impl Default for Config {
@@ -103,6 +104,7 @@ impl Default for Config {
             toast_enabled: true,       // D-12
             clipboard_enabled: false,  // D-12
             toast_click_action: "dismiss".to_string(), // D-14
+            start_with_windows: false, // D-50/D-51
         }
     }
 }
@@ -162,26 +164,56 @@ pub fn load() -> Config {
 }
 
 /// Writes `cfg` as pretty-printed JSON, creating the parent directory if
-/// needed.
+/// needed. Atomic: write to a sibling `.tmp` path, then `std::fs::rename`
+/// over the real target, so a crash mid-write can never leave a torn
+/// `config.json` (D-37), mirroring the tmp-then-rename discipline already
+/// used for capture files in `save.rs`.
 pub fn save(cfg: &Config) -> std::io::Result<()> {
     let path = config_path();
+    let tmp_path = {
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(constants::TMP_SUFFIX);
+        path.with_file_name(name)
+    };
+    save_to(cfg, &path, &tmp_path)
+}
+
+/// Implementation behind `save()`, parameterized on the target/tmp paths so
+/// the atomicity behavior is unit-testable without touching `%APPDATA%`.
+fn save_to(cfg: &Config, path: &std::path::Path, tmp_path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(&path, text)
+    if let Err(e) = std::fs::write(tmp_path, text) {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(tmp_path, path) {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
-/// Strips every character in `\ / : * ? " < > |`, all control characters
-/// (0x00-0x1F are invalid in Windows filenames and trivially expressible
-/// via JSON string escapes), plus all `.` characters (which also kills
-/// `..` traversal and stray extensions), trims ASCII whitespace, and falls
-/// back to `"corvus"` if the result is empty (T-02-01, ASVS V5).
+/// True for every character rejected from a base filename: the reserved
+/// Windows/path-separator set, `.` (which also kills `..` traversal and
+/// stray extensions), and any control character (0x00-0x1F, trivially
+/// expressible via JSON string escapes in a hand-edited config.json). The
+/// single shared authority `sanitize_base_filename` and the future
+/// Settings-window keystroke filter both delegate to (D-45, T-04-01).
+pub fn is_invalid_filename_char(c: char) -> bool {
+    INVALID_FILENAME_CHARS.contains(&c) || c == '.' || c.is_control()
+}
+
+/// Strips every character `is_invalid_filename_char` rejects, trims ASCII
+/// whitespace, and falls back to `"corvus"` if the result is empty
+/// (T-02-01, ASVS V5).
 pub fn sanitize_base_filename(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !INVALID_FILENAME_CHARS.contains(c) && *c != '.' && !c.is_control())
-        .collect();
+    let cleaned: String = raw.chars().filter(|c| !is_invalid_filename_char(*c)).collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         DEFAULT_BASE_FILENAME.to_string()
@@ -190,27 +222,66 @@ pub fn sanitize_base_filename(raw: &str) -> String {
     }
 }
 
-/// Resolves `cfg.save_folder` into a safe destination directory. Falls back
-/// to `constants::default_capture_dir()` if the configured value is empty,
-/// relative, or contains a `..` component, rather than blindly joining an
-/// attacker-shaped path (T-02-02, ASVS V12).
-pub fn resolve_save_folder(cfg: &Config) -> PathBuf {
-    if cfg.save_folder.trim().is_empty() {
-        return constants::default_capture_dir();
+/// Why a typed save-folder path was rejected (D-47/D-48). Distinguishing
+/// these lets the Settings window show the exact rejection reason instead
+/// of one generic message.
+#[derive(Debug)]
+pub enum FolderError {
+    /// Empty, whitespace-only, or not an absolute path.
+    NotAbsolute,
+    /// Absolute, but contains a `..` component.
+    ParentTraversal,
+    /// Absolute and traversal-free, but the folder could not be created.
+    ///
+    /// Not yet constructed: the creatability probe is the caller's job,
+    /// added in a later Phase 4 plan.
+    #[allow(dead_code)]
+    CreateFailed(std::io::Error),
+}
+
+impl std::fmt::Display for FolderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FolderError::NotAbsolute | FolderError::ParentTraversal => {
+                write!(f, "Folder must be an absolute path")
+            }
+            FolderError::CreateFailed(e) => write!(f, "Couldn't create folder: {e}"),
+        }
+    }
+}
+
+/// Pure (filesystem-free) validation of a typed save-folder path: rejects
+/// empty/relative paths as `NotAbsolute` and any `..` component as
+/// `ParentTraversal`, otherwise returns the path unchanged. Implements the
+/// exact rules `resolve_save_folder` uses today (T-04-02, ASVS V12).
+/// Deliberately does not create the directory -- the creatability probe
+/// belongs to the caller (plan 04-04), which maps its `io::Error` into
+/// `FolderError::CreateFailed`.
+pub fn validate_save_folder(raw: &str) -> Result<PathBuf, FolderError> {
+    if raw.trim().is_empty() {
+        return Err(FolderError::NotAbsolute);
     }
 
-    let candidate = PathBuf::from(&cfg.save_folder);
+    let candidate = PathBuf::from(raw);
     if !candidate.is_absolute() {
-        return constants::default_capture_dir();
+        return Err(FolderError::NotAbsolute);
     }
     if candidate
         .components()
         .any(|c| matches!(c, Component::ParentDir))
     {
-        return constants::default_capture_dir();
+        return Err(FolderError::ParentTraversal);
     }
 
-    candidate
+    Ok(candidate)
+}
+
+/// Resolves `cfg.save_folder` into a safe destination directory. Falls back
+/// to `constants::default_capture_dir()` if the configured value fails
+/// `validate_save_folder`, rather than blindly joining an attacker-shaped
+/// path (T-02-02, ASVS V12).
+pub fn resolve_save_folder(cfg: &Config) -> PathBuf {
+    validate_save_folder(&cfg.save_folder).unwrap_or_else(|_| constants::default_capture_dir())
 }
 
 #[cfg(test)]

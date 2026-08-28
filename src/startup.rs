@@ -31,17 +31,20 @@ const STARTUP_APPROVED_SUBKEY: PCWSTR =
 /// would introduce the `\\?\` extended-length prefix and break the shell's
 /// ability to launch it at login.
 pub fn desired_command() -> std::io::Result<String> {
-    // RED: intentionally unquoted placeholder — filled in during GREEN.
     let path = std::env::current_exe()?;
-    Ok(path.to_string_lossy().to_string())
+    let path_str = path.to_string_lossy();
+    let stripped = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
+    Ok(format!("\"{stripped}\""))
 }
 
 /// True when `registry` and `desired` refer to the same command, ignoring
 /// surrounding whitespace, surrounding double quotes, and letter case
 /// (D-51 — Windows paths are case-insensitive).
 pub fn commands_match(registry: &str, desired: &str) -> bool {
-    // RED: intentionally naive placeholder — filled in during GREEN.
-    registry == desired
+    fn norm(s: &str) -> String {
+        s.trim().trim_matches('"').to_lowercase()
+    }
+    norm(registry) == norm(desired)
 }
 
 // Registry wrappers

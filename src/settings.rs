@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, COLOR_BTNFACE,
     HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
@@ -33,7 +34,11 @@ use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, FileOpenDialog, IFileOpenDialog, IShellItem, RemoveWindowSubclass,
+    SHCreateItemFromParsingName, SetWindowSubclass, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+    SIGDN_FILESYSPATH,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
@@ -128,6 +133,11 @@ struct SettingsData {
     /// revert-on-invalid path.
     #[allow(dead_code)]
     last_folder: String,
+    /// True for the duration of the modal `IFileOpenDialog::Show` call
+    /// (Pitfall 11): `open_or_focus()` is a no-op while this is set, so an
+    /// Alt+F9 press during the picker cannot try to foreground a disabled
+    /// owner window.
+    picker_open: bool,
 }
 
 static SETTINGS_DATA: Mutex<Option<SettingsData>> = Mutex::new(None);
@@ -275,6 +285,12 @@ fn message_font_for_dpi(dpi: u32) -> HFONT {
 /// every seam (Alt+F9, tray left-click, tray menu, ERR-01) calls this and
 /// only this (SET-01, D-38).
 pub fn open_or_focus() {
+    // Pitfall 11: the folder picker's modal loop disables its owner
+    // window; foregrounding it here would just fail. No-op instead of
+    // fighting the picker for activation.
+    if with_state(|d| d.picker_open).unwrap_or(false) {
+        return;
+    }
     let existing = *SETTINGS_HWND.lock().unwrap();
     if let Some(raw) = existing {
         let hwnd = HWND(raw as *mut c_void);
@@ -355,6 +371,7 @@ fn create_and_show() {
         dpi,
         closing: false,
         initializing: true,
+        picker_open: false,
     });
     *SETTINGS_HWND.lock().unwrap() = Some(hwnd.0 as isize);
 
@@ -811,6 +828,12 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) {
             with_state(|d| d.cfg.clipboard_enabled = checked);
             persist();
         }
+        (BN_CLICKED, cid) if cid == constants::ID_STARTUP_CHECK => {
+            handle_startup_toggle(hwnd);
+        }
+        (BN_CLICKED, cid) if cid == constants::ID_BROWSE_BTN => {
+            handle_browse(hwnd);
+        }
         (CBN_SELCHANGE, cid) if cid == constants::ID_FORMAT_COMBO => {
             let Some(idx) = get_cursel(hwnd, cid) else {
                 return;
@@ -1047,6 +1070,74 @@ fn commit_folder(hwnd: HWND) {
     persist();
     if let Some(cfg) = with_state(|d| d.cfg.clone()) {
         refresh_preview(hwnd, &cfg);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Browse folder picker (D-47, Pattern 6) and Start with Windows (D-50..D-52)
+// ---------------------------------------------------------------------
+
+/// Shows the shell folder picker owned by `owner`, seeded at `initial` when
+/// that resolves. Returns `None` on cancel (a `Show` `Err` -- silent no-op
+/// per UI-SPEC A10) or any COM failure along the way. The `PWSTR` from
+/// `GetDisplayName` is converted to a Rust `String` BEFORE `CoTaskMemFree`
+/// and always freed, even when conversion fails (Pitfall 9, T-04-22).
+fn pick_folder(owner: HWND, initial: &str) -> Option<std::path::PathBuf> {
+    unsafe {
+        let dlg: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let opts = dlg.GetOptions().unwrap_or_default();
+        dlg.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
+        let title = constants::to_wide("Choose capture folder");
+        let _ = dlg.SetTitle(PCWSTR(title.as_ptr()));
+        if !initial.is_empty() {
+            let wide = constants::to_wide(initial);
+            if let Ok(item) =
+                SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+            {
+                let _ = dlg.SetFolder(&item);
+            }
+        }
+        dlg.Show(Some(owner)).ok()?;
+        let item = dlg.GetResult().ok()?;
+        let pw = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = pw.to_string().ok();
+        CoTaskMemFree(Some(pw.0 as *const c_void));
+        s.map(std::path::PathBuf::from)
+    }
+}
+
+/// `BN_CLICKED` on Browse: shows the picker owned by this window, guarded
+/// by `picker_open` (Pitfall 11), and runs the result through the same
+/// `commit_folder` path typed text uses so creatability is checked in
+/// exactly one place (D-47).
+fn handle_browse(hwnd: HWND) {
+    let initial = with_state(|d| d.last_folder.clone()).unwrap_or_default();
+    with_state(|d| d.picker_open = true);
+    let result = pick_folder(hwnd, &initial);
+    with_state(|d| d.picker_open = false);
+    if let Some(path) = result {
+        set_text(hwnd, constants::ID_FOLDER_EDIT, &path.to_string_lossy());
+        commit_folder(hwnd);
+    }
+}
+
+/// `BN_CLICKED` on Start with Windows: reads the control's own new state,
+/// calls `startup::set_enabled`. On failure the checkbox reverts to
+/// unchecked and the OS error shows next to it; nothing is persisted as
+/// enabled (D-52). On success the config snapshot picks up the user's
+/// intent for the next launch's self-heal (D-50).
+fn handle_startup_toggle(hwnd: HWND) {
+    let checked = get_check(hwnd, constants::ID_STARTUP_CHECK);
+    match startup::set_enabled(checked) {
+        Ok(()) => {
+            with_state(|d| d.cfg.start_with_windows = checked);
+            persist();
+        }
+        Err(e) => {
+            set_check(hwnd, constants::ID_STARTUP_CHECK, false);
+            show_hint(hwnd, constants::ID_STARTUP_HINT, &e.to_string());
+        }
     }
 }
 

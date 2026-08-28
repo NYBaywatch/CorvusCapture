@@ -12,9 +12,11 @@ mod hotkeys;
 mod overlay;
 mod save;
 mod singleinstance;
+mod startup;
 mod toast;
 mod tray;
 
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
@@ -167,6 +169,16 @@ fn main() {
         overlay_selftest_and_exit();
     }
 
+    // STA COM apartment for the later shell folder picker (IFileOpenDialog),
+    // initialized once on the pump thread before any window exists so no
+    // per-click initialization is needed. S_FALSE (already initialized) is
+    // a success case, not an error -- the HRESULT is intentionally ignored.
+    // Never CoUninitialize: the process exits via PostQuitMessage/return
+    // from main, not an explicit teardown path.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    }
+
     let _hwnd = app::create_main_window().expect("failed to create main window");
     let _tray = tray::init().expect("failed to create tray icon");
 
@@ -183,6 +195,14 @@ fn main() {
         &config::sanitize_base_filename(&cfg.base_filename),
     );
     let _saver = save::init();
+
+    // D-50: rewrite a missing or stale Run value at launch whenever the
+    // user's stored autostart intent is on (e.g. the exe was moved).
+    // Reuses the startup-only snapshot above -- app::dispatch re-reads
+    // config per capture (D-11), but this one-shot self-heal does not.
+    if cfg.start_with_windows {
+        startup::self_heal();
+    }
 
     // Registered strictly after the window and tray exist (RESEARCH.md
     // Pitfall 2). Kept alive for the process lifetime -- dropping it

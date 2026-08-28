@@ -207,6 +207,89 @@ pub const OVERLAY_CHIP_RADIUS: i32 = 6;
 pub const OVERLAY_FONT_HEIGHT: i32 = 18;
 
 // ---------------------------------------------------------------------
+// Settings window (Phase 4)
+// ---------------------------------------------------------------------
+
+/// Window class name for the raw Win32 Settings window.
+///
+/// Not yet consumed: window creation arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_WINDOW_CLASS: &str = "CorvusCaptureSettingsWnd";
+
+/// Settings window title bar text.
+///
+/// Not yet consumed: window creation arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_WINDOW_TITLE: &str = "Corvus Capture Settings";
+
+/// Fixed client width in logical (96-DPI) pixels (UI-SPEC Layout Contract).
+///
+/// Not yet consumed: layout code arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_CLIENT_W: i32 = 400;
+
+/// Fixed client height in logical (96-DPI) pixels (UI-SPEC Layout Contract).
+///
+/// Not yet consumed: layout code arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_CLIENT_H: i32 = 460;
+
+/// Inline validation/error hint auto-dismiss duration (D-45/D-46/D-48/D-52).
+///
+/// Not yet consumed: hint mechanism arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_HINT_MS: u32 = 2500;
+
+/// Base timer id for Settings hint auto-dismiss timers. Offset well clear of
+/// `TOAST_TIMER_ID` so the two windows' `SetTimer` ids can never collide.
+///
+/// Not yet consumed: hint mechanism arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const SETTINGS_HINT_TIMER_BASE: usize = 100;
+
+/// HKCU `...\Run` value name written for Start with Windows (D-50/D-51).
+///
+/// Not yet consumed: registry module arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const RUN_VALUE_NAME: &str = "CorvusCapture";
+
+// Control IDs, starting at 100 (never 1/2 -- those are IDOK/IDCANCEL,
+// delivered by IsDialogMessageW). One per interactive/addressable control
+// in the UI-SPEC layout table.
+//
+// Not yet consumed: window creation arrives in a later Phase 4 plan.
+#[allow(dead_code)]
+pub const ID_BASE_EDIT: i32 = 100;
+#[allow(dead_code)]
+pub const ID_BASE_HINT: i32 = 101;
+#[allow(dead_code)]
+pub const ID_FOLDER_EDIT: i32 = 102;
+#[allow(dead_code)]
+pub const ID_FOLDER_HINT: i32 = 103;
+#[allow(dead_code)]
+pub const ID_BROWSE_BTN: i32 = 104;
+#[allow(dead_code)]
+pub const ID_PREVIEW: i32 = 105;
+#[allow(dead_code)]
+pub const ID_FORMAT_COMBO: i32 = 106;
+#[allow(dead_code)]
+pub const ID_QUALITY_LABEL: i32 = 107;
+#[allow(dead_code)]
+pub const ID_QUALITY_SLIDER: i32 = 108;
+#[allow(dead_code)]
+pub const ID_QUALITY_VALUE: i32 = 109;
+#[allow(dead_code)]
+pub const ID_TOAST_CHECK: i32 = 110;
+#[allow(dead_code)]
+pub const ID_CLICK_ACTION_COMBO: i32 = 111;
+#[allow(dead_code)]
+pub const ID_CLIPBOARD_CHECK: i32 = 112;
+#[allow(dead_code)]
+pub const ID_STARTUP_CHECK: i32 = 113;
+#[allow(dead_code)]
+pub const ID_STARTUP_HINT: i32 = 114;
+
+// ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
 

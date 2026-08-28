@@ -26,7 +26,7 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT, EM_SETSEL,
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, TBM_SETPAGESIZE,
     TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBM_SETTICFREQ, TBS_AUTOTICKS, TBS_HORZ,
-    TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
+    TB_THUMBTRACK, TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
@@ -36,10 +36,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
     GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
     IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, BM_SETCHECK, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
-    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_SETCURSEL, ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL,
-    HMENU, IDCANCEL, IDC_ARROW, MSG, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_SETFONT,
+    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK,
+    BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
+    CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
+    ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL, IDC_ARROW, MSG,
+    SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_SETFONT,
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
@@ -48,6 +50,7 @@ use crate::config::{self, Config, Format};
 use crate::constants;
 use crate::save;
 use crate::startup;
+use crate::toast;
 
 /// `TBM_GETPOS` is not exported by `windows` 0.62.2 (grep of the whole
 /// crate finds nothing); declared locally per commctrl.h (`WM_USER + 0`),
@@ -742,6 +745,131 @@ fn set_initial_focus(hwnd: HWND) {
 }
 
 // ---------------------------------------------------------------------
+// Instant-apply commit model (D-37, D-39, SET-03)
+// ---------------------------------------------------------------------
+
+/// Copies the current `Config` snapshot out of `SETTINGS_DATA`, drops the
+/// guard, then calls `config::save`. On failure, toasts the OS error --
+/// the in-memory snapshot (already mutated by the caller before this is
+/// called) keeps the user's value regardless of whether the write
+/// succeeded (D-39). Never call this while holding the `SETTINGS_DATA`
+/// guard (`with_state`'s closure must not call `persist`).
+fn persist() {
+    let Some(cfg) = with_state(|d| d.cfg.clone()) else {
+        return;
+    };
+    if let Err(e) = config::save(&cfg) {
+        toast::show(&format!("Couldn't save settings: {e}"));
+    }
+}
+
+/// `BM_GETCHECK` against `BST_CHECKED` on the control addressed by `id` --
+/// reads the control's own current state rather than trusting message
+/// parameters (T-04-23).
+fn get_check(hwnd: HWND, id: i32) -> bool {
+    let Ok(ctrl) = (unsafe { GetDlgItem(Some(hwnd), id) }) else {
+        return false;
+    };
+    let state = unsafe { SendMessageW(ctrl, BM_GETCHECK, None, None) };
+    state.0 as i32 == BST_CHECKED.0 as i32
+}
+
+/// `CB_GETCURSEL` on the combo addressed by `id`. `None` on `CB_ERR` (no
+/// selection) so callers can ignore a spurious notification.
+fn get_cursel(hwnd: HWND, id: i32) -> Option<usize> {
+    let ctrl = unsafe { GetDlgItem(Some(hwnd), id) }.ok()?;
+    let sel = unsafe { SendMessageW(ctrl, CB_GETCURSEL, None, None) };
+    if sel.0 as i32 == CB_ERR {
+        None
+    } else {
+        Some(sel.0 as usize)
+    }
+}
+
+/// Dispatches a `WM_COMMAND` notification (high word = notification code,
+/// low word = control id) once the window has finished `populate()` and is
+/// not tearing down. Every control this window creates that mutates
+/// `Config` is handled here.
+fn handle_command(hwnd: HWND, wparam: WPARAM) {
+    let notify_code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+    let id = (wparam.0 & 0xFFFF) as i32;
+
+    match (notify_code, id) {
+        (BN_CLICKED, cid) if cid == constants::ID_TOAST_CHECK => {
+            let checked = get_check(hwnd, cid);
+            with_state(|d| d.cfg.toast_enabled = checked);
+            persist();
+        }
+        (BN_CLICKED, cid) if cid == constants::ID_CLIPBOARD_CHECK => {
+            let checked = get_check(hwnd, cid);
+            with_state(|d| d.cfg.clipboard_enabled = checked);
+            persist();
+        }
+        (CBN_SELCHANGE, cid) if cid == constants::ID_FORMAT_COMBO => {
+            let Some(idx) = get_cursel(hwnd, cid) else {
+                return;
+            };
+            let fmt = match idx {
+                1 => Format::Jpg,
+                2 => Format::Bmp,
+                3 => Format::Webp,
+                _ => Format::Png,
+            };
+            let fmt_str = match fmt {
+                Format::Png => "png",
+                Format::Jpg => "jpg",
+                Format::Bmp => "bmp",
+                Format::Webp => "webp",
+            };
+            with_state(|d| d.cfg.format = fmt_str.to_string());
+            persist();
+            apply_format_visibility(hwnd, fmt);
+            if let Some(cfg) = with_state(|d| d.cfg.clone()) {
+                refresh_preview(hwnd, &cfg);
+            }
+        }
+        (CBN_SELCHANGE, cid) if cid == constants::ID_CLICK_ACTION_COMBO => {
+            let Some(idx) = get_cursel(hwnd, cid) else {
+                return;
+            };
+            let action_str = match idx {
+                1 => "open_file",
+                2 => "reveal_explorer",
+                _ => "dismiss",
+            };
+            with_state(|d| d.cfg.toast_click_action = action_str.to_string());
+            persist();
+        }
+        _ if id == IDCANCEL.0 => {
+            close(hwnd);
+        }
+        _ => {}
+    }
+}
+
+/// `WM_HSCROLL` from the JPG quality trackbar: always updates the live
+/// value static, but only writes config.json when the drag has completed
+/// (`LOWORD(wParam) != TB_THUMBTRACK`) -- one write per finished change,
+/// not one per mouse pixel (T-04-24).
+fn handle_hscroll(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let Ok(slider) = (unsafe { GetDlgItem(Some(hwnd), constants::ID_QUALITY_SLIDER) }) else {
+        return;
+    };
+    if lparam.0 != slider.0 as isize {
+        return;
+    }
+    let pos = unsafe { SendMessageW(slider, TBM_GETPOS, None, None) };
+    let value = (pos.0 as i32).clamp(50, 100) as u8;
+    set_text(hwnd, constants::ID_QUALITY_VALUE, &value.to_string());
+
+    let code = (wparam.0 & 0xFFFF) as u32;
+    if code != TB_THUMBTRACK {
+        with_state(|d| d.cfg.jpg_quality = value);
+        persist();
+    }
+}
+
+// ---------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------
 
@@ -844,12 +972,24 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_COMMAND => {
-            // T-04-11: wparam is opaque, matched only against the known
-            // IDCANCEL id delivered by IsDialogMessageW for Esc; every
-            // other id falls through (plan 04-04 adds real handlers).
-            let id = (wparam.0 & 0xFFFF) as i32;
-            if id == IDCANCEL.0 {
-                close(hwnd);
+            let initializing_or_closing =
+                with_state(|d| d.initializing || d.closing).unwrap_or(true);
+            if !initializing_or_closing {
+                handle_command(hwnd, wparam);
+            } else {
+                // Even while initializing/closing, IDCANCEL (Esc) must
+                // still close the window.
+                let id = (wparam.0 & 0xFFFF) as i32;
+                if id == IDCANCEL.0 {
+                    close(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_HSCROLL => {
+            let initializing = with_state(|d| d.initializing).unwrap_or(true);
+            if !initializing {
+                handle_hscroll(hwnd, wparam, lparam);
             }
             LRESULT(0)
         }

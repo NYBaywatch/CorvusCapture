@@ -128,6 +128,23 @@ fn overlay_selftest_and_exit() -> ! {
     std::process::exit(code);
 }
 
+/// Dev-only: exercises `settings::run_selftest()` end-to-end -- opens the
+/// Settings window, asserts every `ID_*` control exists, prints the
+/// resolved DPI/client size/preview text, and closes it. Not a shipped
+/// feature. Runs before any tray/hotkey init, mirroring the other
+/// selftests' shape.
+fn settings_selftest_and_exit() -> ! {
+    let _hwnd = app::create_main_window().expect("failed to create main window");
+
+    let (message, code) = match settings::run_selftest() {
+        Ok(info) => (format!("Corvus Capture: --settings-selftest PASSED ({info})\0"), 0),
+        Err(e) => (format!("Corvus Capture: --settings-selftest FAILED: {e}\0"), 3),
+    };
+    let wide: Vec<u16> = message.encode_utf16().collect();
+    unsafe { OutputDebugStringW(windows::core::PCWSTR(wide.as_ptr())) };
+    std::process::exit(code);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -168,6 +185,14 @@ fn main() {
     // hotkey and cannot collide with a real Shift+F9 press.
     if args.iter().any(|a| a == "--overlay-selftest") {
         overlay_selftest_and_exit();
+    }
+
+    // Hidden dev affordance: `--settings-selftest` proves the Settings
+    // window's control set exists programmatically. Not a shipped
+    // feature. Runs before any tray/hotkey init, same reasoning as the
+    // other selftests above.
+    if args.iter().any(|a| a == "--settings-selftest") {
+        settings_selftest_and_exit();
     }
 
     // STA COM apartment for the later shell folder picker (IFileOpenDialog),

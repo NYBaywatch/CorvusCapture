@@ -23,26 +23,31 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, EM_SETLIMITTEXT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
-    INITCOMMONCONTROLSEX, TBM_SETPAGESIZE, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBM_SETTICFREQ,
-    TBS_AUTOTICKS, TBS_HORZ, TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
+    InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT, EM_SETSEL,
+    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, TBM_SETPAGESIZE,
+    TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBM_SETTICFREQ, TBS_AUTOTICKS, TBS_HORZ,
+    TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos,
-    GetForegroundWindow, IsDialogMessageW, IsIconic, IsWindow, KillTimer, LoadCursorW,
-    LoadIconW, MoveWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, ES_AUTOHSCROLL,
-    FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL, IDC_ARROW, MSG, SPI_GETNONCLIENTMETRICS,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_SETFONT, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED,
-    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
+    GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
+    IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowPos, SetWindowTextW, ShowWindow, BM_SETCHECK, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
+    CBS_DROPDOWNLIST, CB_ADDSTRING, CB_SETCURSEL, ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL,
+    HMENU, IDCANCEL, IDC_ARROW, MSG, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_SETFONT,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Format};
 use crate::constants;
+use crate::save;
+use crate::startup;
 
 /// `TBM_GETPOS` is not exported by `windows` 0.62.2 (grep of the whole
 /// crate finds nothing); declared locally per commctrl.h (`WM_USER + 0`),
@@ -85,9 +90,6 @@ static COMMON_CONTROLS_INIT: OnceLock<()> = OnceLock::new();
 struct SettingsData {
     /// The config snapshot loaded once at open (D-39) -- never reloaded
     /// inside a notification handler.
-    ///
-    /// Not yet read: population arrives in Task 3.
-    #[allow(dead_code)]
     cfg: Config,
     /// The current message font, as an `HFONT` bit pattern (`isize`) --
     /// handles are not `Send`, so raw values are stored instead.
@@ -565,16 +567,179 @@ fn layout(hwnd: HWND, dpi: u32) {
 }
 
 // ---------------------------------------------------------------------
-// Population -- filled in by Task 3
+// Population (D-39, D-43, D-49, D-51)
 // ---------------------------------------------------------------------
 
-/// Populates every control from the config/registry snapshot. No-op in
-/// this task -- there are no children yet.
-fn populate(_hwnd: HWND) {}
+/// Fixed combo item order (UI-SPEC Copywriting Contract) -- index maps
+/// 1:1 to the `Format` variant order.
+const FORMAT_ITEMS: [&str; 4] = ["PNG", "JPG", "BMP", "WebP (lossless)"];
 
-/// Sets initial focus. No-op in this task -- there is no base-filename
-/// edit yet to focus.
-fn set_initial_focus(_hwnd: HWND) {}
+/// Fixed combo item order (UI-SPEC Copywriting Contract, D-53) -- index
+/// maps 1:1 to the `ClickAction` variant order.
+const CLICK_ACTION_ITEMS: [&str; 3] = ["Dismiss", "Open file", "Reveal in Explorer"];
+
+fn format_index(fmt: Format) -> usize {
+    match fmt {
+        Format::Png => 0,
+        Format::Jpg => 1,
+        Format::Bmp => 2,
+        Format::Webp => 3,
+    }
+}
+
+fn click_action_index(action: config::ClickAction) -> usize {
+    match action {
+        config::ClickAction::Dismiss => 0,
+        config::ClickAction::OpenFile => 1,
+        config::ClickAction::RevealExplorer => 2,
+    }
+}
+
+/// `SetWindowTextW` on the control addressed by `id`, if it exists.
+fn set_text(hwnd: HWND, id: i32, text: &str) {
+    if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+        let wide = constants::to_wide(text);
+        unsafe {
+            let _ = SetWindowTextW(ctrl, PCWSTR(wide.as_ptr()));
+        }
+    }
+}
+
+/// `BM_SETCHECK` on the checkbox addressed by `id`, if it exists.
+fn set_check(hwnd: HWND, id: i32, checked: bool) {
+    if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+        let state = if checked { BST_CHECKED.0 } else { BST_UNCHECKED.0 };
+        unsafe {
+            let _ = SendMessageW(ctrl, BM_SETCHECK, Some(WPARAM(state as usize)), None);
+        }
+    }
+}
+
+/// Fills the format combo with the fixed item order and selects `fmt`.
+/// `CB_SETCURSEL` does not emit `CBN_SELCHANGE` (safe to call while
+/// `initializing`).
+fn fill_format_combo(hwnd: HWND, fmt: Format) {
+    if let Ok(combo) = unsafe { GetDlgItem(Some(hwnd), constants::ID_FORMAT_COMBO) } {
+        for item in FORMAT_ITEMS {
+            let wide = constants::to_wide(item);
+            unsafe {
+                let _ = SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(wide.as_ptr() as isize)),
+                );
+            }
+        }
+        unsafe {
+            let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(format_index(fmt))), None);
+        }
+    }
+}
+
+/// Fills the toast-click-action combo (D-53) with the fixed item order and
+/// selects `action`.
+fn fill_click_action_combo(hwnd: HWND, action: config::ClickAction) {
+    if let Ok(combo) = unsafe { GetDlgItem(Some(hwnd), constants::ID_CLICK_ACTION_COMBO) } {
+        for item in CLICK_ACTION_ITEMS {
+            let wide = constants::to_wide(item);
+            unsafe {
+                let _ = SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(wide.as_ptr() as isize)),
+                );
+            }
+        }
+        unsafe {
+            let _ = SendMessageW(
+                combo,
+                CB_SETCURSEL,
+                Some(WPARAM(click_action_index(action))),
+                None,
+            );
+        }
+    }
+}
+
+/// Shows the JPG quality label/slider/value only when `fmt` is JPG (D-43);
+/// the window's fixed size means the row's space is always reserved.
+/// Hidden controls are automatically skipped by `IsDialogMessageW` tab
+/// navigation.
+fn apply_format_visibility(hwnd: HWND, fmt: Format) {
+    let cmd = if fmt == Format::Jpg { SW_SHOW } else { SW_HIDE };
+    for id in [
+        constants::ID_QUALITY_LABEL,
+        constants::ID_QUALITY_SLIDER,
+        constants::ID_QUALITY_VALUE,
+    ] {
+        if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+            unsafe {
+                let _ = ShowWindow(ctrl, cmd);
+            }
+        }
+    }
+}
+
+/// Sets the read-only next-file preview line (D-49), sharing the save
+/// pipeline's own numbering (`save::peek_next_filename`) so the preview
+/// can never disagree with a real reservation.
+fn refresh_preview(hwnd: HWND, cfg: &Config) {
+    let text = format!("Next: {}", save::peek_next_filename(cfg));
+    set_text(hwnd, constants::ID_PREVIEW, &text);
+}
+
+/// Populates every control from the single config snapshot loaded at open
+/// (D-39) plus the registry for the Start-with-Windows checkbox (D-51).
+/// Called once, at the end of window creation, while `initializing` is
+/// still true.
+fn populate(hwnd: HWND) {
+    let Some(cfg) = with_state(|d| d.cfg.clone()) else {
+        return;
+    };
+
+    set_text(hwnd, constants::ID_BASE_EDIT, &cfg.base_filename);
+    // Never blank: the resolved default is shown even when the stored
+    // value is empty or was rejected.
+    let folder = config::resolve_save_folder(&cfg).to_string_lossy().into_owned();
+    set_text(hwnd, constants::ID_FOLDER_EDIT, &folder);
+
+    let fmt = Format::from_str(&cfg.format);
+    fill_format_combo(hwnd, fmt);
+    fill_click_action_combo(hwnd, config::ClickAction::from_str(&cfg.toast_click_action));
+
+    if let Ok(slider) = unsafe { GetDlgItem(Some(hwnd), constants::ID_QUALITY_SLIDER) } {
+        unsafe {
+            let _ = SendMessageW(
+                slider,
+                TBM_SETPOS,
+                Some(WPARAM(1)),
+                Some(LPARAM(cfg.jpg_quality as isize)),
+            );
+        }
+    }
+    set_text(hwnd, constants::ID_QUALITY_VALUE, &cfg.jpg_quality.to_string());
+
+    set_check(hwnd, constants::ID_TOAST_CHECK, cfg.toast_enabled);
+    set_check(hwnd, constants::ID_CLIPBOARD_CHECK, cfg.clipboard_enabled);
+    // D-51: the checkbox reflects the registry, not the config flag.
+    set_check(hwnd, constants::ID_STARTUP_CHECK, startup::is_registered());
+
+    apply_format_visibility(hwnd, fmt);
+    refresh_preview(hwnd, &cfg);
+}
+
+/// Sets focus to the base filename edit with its contents selected, once
+/// the window is shown and foregrounded (UI-SPEC A8).
+fn set_initial_focus(hwnd: HWND) {
+    if let Ok(edit) = unsafe { GetDlgItem(Some(hwnd), constants::ID_BASE_EDIT) } {
+        unsafe {
+            let _ = SetFocus(Some(edit));
+            let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // Window procedure
@@ -597,6 +762,79 @@ fn close(hwnd: HWND) {
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
+}
+
+// ---------------------------------------------------------------------
+// Dev-only: --settings-selftest (main.rs)
+// ---------------------------------------------------------------------
+
+fn current_hwnd() -> Option<HWND> {
+    SETTINGS_HWND.lock().unwrap().map(|raw| HWND(raw as *mut c_void))
+}
+
+/// Closes the currently-open Settings window immediately, mirroring
+/// `overlay.rs`'s `close_active` dev affordance.
+fn close_active() {
+    if let Some(hwnd) = current_hwnd() {
+        close(hwnd);
+    }
+}
+
+/// Reads back a control's current text via `GetDlgItem` + `GetWindowTextW`.
+/// Empty string if the control doesn't exist or has no text.
+fn read_text(hwnd: HWND, id: i32) -> String {
+    let Ok(ctrl) = (unsafe { GetDlgItem(Some(hwnd), id) }) else {
+        return String::new();
+    };
+    let len = unsafe { GetWindowTextLengthW(ctrl) };
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; (len as usize) + 1];
+    let n = unsafe { GetWindowTextW(ctrl, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// Every addressable (`ID_*`) control the window creates -- the exact set
+/// `--settings-selftest` proves exists via `GetDlgItem`.
+const ALL_CONTROL_IDS: [i32; 15] = [
+    constants::ID_BASE_EDIT,
+    constants::ID_BASE_HINT,
+    constants::ID_FOLDER_EDIT,
+    constants::ID_FOLDER_HINT,
+    constants::ID_BROWSE_BTN,
+    constants::ID_PREVIEW,
+    constants::ID_FORMAT_COMBO,
+    constants::ID_QUALITY_LABEL,
+    constants::ID_QUALITY_SLIDER,
+    constants::ID_QUALITY_VALUE,
+    constants::ID_TOAST_CHECK,
+    constants::ID_CLICK_ACTION_COMBO,
+    constants::ID_CLIPBOARD_CHECK,
+    constants::ID_STARTUP_CHECK,
+    constants::ID_STARTUP_HINT,
+];
+
+/// Dev-only (`--settings-selftest`, main.rs): opens the window, asserts
+/// every `ID_*` control exists via `GetDlgItem`, and returns a one-line
+/// summary (resolved DPI, scaled client size, preview text) on success or
+/// a failure reason. Always closes the window before returning.
+pub fn run_selftest() -> Result<String, String> {
+    open_or_focus();
+    let result = (|| {
+        let hwnd = current_hwnd().ok_or_else(|| "Settings window did not open".to_string())?;
+        for id in ALL_CONTROL_IDS {
+            unsafe { GetDlgItem(Some(hwnd), id) }
+                .map_err(|_| format!("control id {id} not found"))?;
+        }
+        let dpi = with_state(|d| d.dpi).ok_or_else(|| "no DPI recorded".to_string())?;
+        let w = scale(constants::SETTINGS_CLIENT_W, dpi);
+        let h = scale(constants::SETTINGS_CLIENT_H, dpi);
+        let preview = read_text(hwnd, constants::ID_PREVIEW);
+        Ok(format!("dpi={dpi} client={w}x{h} preview=\"{preview}\""))
+    })();
+    close_active();
+    result
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

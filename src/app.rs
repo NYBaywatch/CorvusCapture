@@ -21,6 +21,7 @@ use crate::about;
 use crate::constants;
 use crate::hotkeys;
 use crate::overlay;
+use crate::settings;
 use crate::singleinstance;
 use crate::toast;
 use crate::tray;
@@ -225,6 +226,12 @@ pub fn run_message_loop() {
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Settings-window keyboard interface (Tab/Shift+Tab/arrows/
+            // mnemonics/Enter/Esc): a message IsDialogMessageW consumes
+            // must never reach TranslateMessage/DispatchMessageW.
+            if settings::is_dialog_message(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -248,10 +255,8 @@ pub fn dispatch(action: AppAction) {
         // selection exists, cancel otherwise (guarded against hotkey
         // autorepeat inside hotkey_toggle itself).
         AppAction::CaptureRegion if overlay::is_active() => overlay::hotkey_toggle(),
-        // Phase 1 stub (TRAY-03): the real Settings window is Phase 4.
-        AppAction::OpenSettings => {
-            toast::show("Settings — coming in a later version");
-        }
+        // Phase 4: open (or focus) the real Settings window.
+        AppAction::OpenSettings => settings::open_or_focus(),
         AppAction::OpenCaptureFolder => {
             // WR-03: resolve the folder from config exactly like the save
             // pipeline does (D-11: re-read at action time) -- opening the

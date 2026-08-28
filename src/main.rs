@@ -11,6 +11,7 @@ mod constants;
 mod hotkeys;
 mod overlay;
 mod save;
+mod settings;
 mod singleinstance;
 mod startup;
 mod toast;

@@ -1042,13 +1042,23 @@ fn commit_base_filename(hwnd: HWND) {
         // value in the edit so the field and config.json agree.
         set_text(hwnd, constants::ID_BASE_EDIT, &trimmed);
     }
-    with_state(|d| {
+    // D-37: persist only on a real change. Tab-through, the close-funnel
+    // double commit, and Esc on a defaults-loaded (malformed, D-13) config
+    // must not rewrite the user's file.
+    let changed = with_state(|d| {
+        if d.last_base == trimmed {
+            return false;
+        }
         d.cfg.base_filename = trimmed.clone();
         d.last_base = trimmed.clone();
-    });
-    persist();
-    if let Some(cfg) = with_state(|d| d.cfg.clone()) {
-        refresh_preview(hwnd, &cfg);
+        true
+    })
+    .unwrap_or(false);
+    if changed {
+        persist();
+        if let Some(cfg) = with_state(|d| d.cfg.clone()) {
+            refresh_preview(hwnd, &cfg);
+        }
     }
 }
 
@@ -1076,13 +1086,21 @@ fn commit_folder(hwnd: HWND) {
         return;
     }
     let path_str = path.to_string_lossy().into_owned();
-    with_state(|d| {
+    // D-37: persist only on a real change (see commit_base_filename).
+    let changed = with_state(|d| {
+        if d.last_folder == path_str {
+            return false;
+        }
         d.cfg.save_folder = path_str.clone();
         d.last_folder = path_str.clone();
-    });
-    persist();
-    if let Some(cfg) = with_state(|d| d.cfg.clone()) {
-        refresh_preview(hwnd, &cfg);
+        true
+    })
+    .unwrap_or(false);
+    if changed {
+        persist();
+        if let Some(cfg) = with_state(|d| d.cfg.clone()) {
+            refresh_preview(hwnd, &cfg);
+        }
     }
 }
 

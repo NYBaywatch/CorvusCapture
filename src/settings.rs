@@ -1286,6 +1286,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_DPICHANGED => {
+            // T-01-04: never dereference a caller-supplied pointer without
+            // a guard. Any local process can forge this message with
+            // lparam = 0; ignore it rather than crash the tray app.
+            let rect_ptr = lparam.0 as *const RECT;
+            if rect_ptr.is_null() {
+                return LRESULT(0);
+            }
             let new_dpi = (wparam.0 >> 16) as u32;
             let new_font = message_font_for_dpi(new_dpi);
             let children = with_state(|d| d.all_children.clone()).unwrap_or_default();
@@ -1316,7 +1323,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             layout(hwnd, new_dpi);
-            let suggested = unsafe { *(lparam.0 as *const RECT) };
+            let suggested = unsafe { *rect_ptr };
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,

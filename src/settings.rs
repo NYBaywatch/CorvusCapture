@@ -1019,9 +1019,17 @@ fn sweep_base_filename(hwnd: HWND) {
 /// or the close path): empty/whitespace-only reverts to `last_base` with a
 /// hint and does not persist (D-46 -- `corvus` is never substituted here).
 /// Interior whitespace is preserved, matching `sanitize_base_filename`.
+/// The text is run through `config::is_invalid_filename_char` first (D-45,
+/// the single shared authority), so invalid characters from a hand-edited
+/// config -- populated while `initializing` gated the `EN_CHANGE` sweep --
+/// can't round-trip back into config.json.
 fn commit_base_filename(hwnd: HWND) {
     let text = read_text(hwnd, constants::ID_BASE_EDIT);
-    let trimmed = text.trim();
+    let cleaned: String = text
+        .chars()
+        .filter(|c| !config::is_invalid_filename_char(*c))
+        .collect();
+    let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         let last = with_state(|d| d.last_base.clone()).unwrap_or_default();
         set_text(hwnd, constants::ID_BASE_EDIT, &last);
@@ -1029,6 +1037,11 @@ fn commit_base_filename(hwnd: HWND) {
         return;
     }
     let trimmed = trimmed.to_string();
+    if cleaned != text {
+        // Filtering removed invalid characters: reflect the committed
+        // value in the edit so the field and config.json agree.
+        set_text(hwnd, constants::ID_BASE_EDIT, &trimmed);
+    }
     with_state(|d| {
         d.cfg.base_filename = trimmed.clone();
         d.last_base = trimmed.clone();

@@ -242,9 +242,8 @@ pub enum FolderError {
 impl std::fmt::Display for FolderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FolderError::NotAbsolute | FolderError::ParentTraversal => {
-                write!(f, "Folder must be an absolute path")
-            }
+            FolderError::NotAbsolute => write!(f, "Folder must be an absolute path"),
+            FolderError::ParentTraversal => write!(f, "Folder path can't contain \"..\""),
             FolderError::CreateFailed(e) => write!(f, "Couldn't create folder: {e}"),
         }
     }

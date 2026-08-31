@@ -1123,9 +1123,9 @@ fn handle_browse(hwnd: HWND) {
 }
 
 /// `BN_CLICKED` on Start with Windows: reads the control's own new state,
-/// calls `startup::set_enabled`. On failure the checkbox reverts to
-/// unchecked and the OS error shows next to it; nothing is persisted as
-/// enabled (D-52). On success the config snapshot picks up the user's
+/// calls `startup::set_enabled`. On failure the checkbox reverts to the
+/// actual registry state and the OS error shows next to it; nothing is
+/// persisted as enabled (D-52). On success the config snapshot picks up the user's
 /// intent for the next launch's self-heal (D-50).
 fn handle_startup_toggle(hwnd: HWND) {
     let checked = get_check(hwnd, constants::ID_STARTUP_CHECK);
@@ -1135,7 +1135,10 @@ fn handle_startup_toggle(hwnd: HWND) {
             persist();
         }
         Err(e) => {
-            set_check(hwnd, constants::ID_STARTUP_CHECK, false);
+            // Revert to the registry-derived state (D-51): a failed
+            // *disable* leaves the Run value in place, so a hardcoded
+            // `false` would display the opposite of the truth.
+            set_check(hwnd, constants::ID_STARTUP_CHECK, startup::is_registered());
             show_hint(hwnd, constants::ID_STARTUP_HINT, &e.to_string());
         }
     }

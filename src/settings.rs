@@ -287,11 +287,14 @@ fn saved_position_rect_and_dpi(cfg: &Config) -> Option<(RECT, u32)> {
         let _ = AdjustWindowRectExForDpi(&mut r, WINDOW_STYLE_FLAGS, false, Default::default(), dx);
     }
     let (w, h) = (r.right - r.left, r.bottom - r.top);
+    // WR-02: window_x/window_y come straight from a (possibly hand-edited)
+    // config.json with no range validation -- saturate instead of panicking
+    // (debug) or wrapping into a garbage rect (release, overflow checks off).
     let rect = RECT {
         left: x,
         top: y,
-        right: x + w,
-        bottom: y + h,
+        right: x.saturating_add(w),
+        bottom: y.saturating_add(h),
     };
 
     let validate_hmon = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };

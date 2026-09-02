@@ -52,10 +52,15 @@ def draw_crow(size: int) -> Image.Image:
 def add_white_outline(img: Image.Image) -> Image.Image:
     """Composites a white ring around `img`'s silhouette so the crow reads
     clearly against a dark taskbar at real 16x16 tray size (RESEARCH.md
-    Pattern 2). Dilates the alpha channel with a MaxFilter to build the ring
-    mask, then alpha-composites the original black crow back on top."""
+    Pattern 2). Dilates the alpha channel with a MaxFilter sized to the
+    frame (ring ~= size/8 px) to build the ring mask, then alpha-composites
+    the original black crow back on top. Applied per-frame AFTER resizing —
+    outlining only the 256px master and downsampling shrinks the ring to a
+    fraction of a pixel at 16x16, making it invisible."""
+    size = img.size[0]
+    kernel = 2 * max(2, size // 8) + 1  # odd; ring thickness = (kernel-1)/2
     alpha = img.split()[3]
-    dilated_alpha = alpha.filter(ImageFilter.MaxFilter(13))
+    dilated_alpha = alpha.filter(ImageFilter.MaxFilter(kernel))
 
     white_ring = Image.new("RGBA", img.size, (255, 255, 255, 0))
     white_ring.putalpha(dilated_alpha)
@@ -64,22 +69,22 @@ def add_white_outline(img: Image.Image) -> Image.Image:
 
 
 def main() -> None:
-    base = draw_crow(CANVAS)
-    base = add_white_outline(base)
+    crow = draw_crow(CANVAS)
     frames = []
     for size in SIZES:
         if size == CANVAS:
-            frame = base
+            frame = add_white_outline(crow)
         else:
-            frame = base.resize((size, size), Image.LANCZOS)
+            frame = add_white_outline(crow.resize((size, size), Image.LANCZOS))
         frames.append(frame)
+    base = frames[SIZES.index(CANVAS)]
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     base.save(
         OUT_PATH,
         format="ICO",
         sizes=[(s, s) for s in SIZES],
-        append_images=frames[1:],
+        append_images=[f for f in frames if f is not base],
     )
     print(f"Wrote {OUT_PATH} with frames: {SIZES}")
 

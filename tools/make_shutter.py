@@ -21,19 +21,21 @@ SAMPLE_RATE = 22050
 OUT_PATH = Path(__file__).resolve().parent.parent / "resources" / "shutter.wav"
 
 # Total duration of the generated clip, in seconds.
-TOTAL_DURATION_S = 0.3
+TOTAL_DURATION_S = 0.35
 
-# Burst 1: sharp attack, fast decay.
+# Burst 1: sharp attack, fast decay. Durations/decays sized so the clicks
+# carry enough acoustic energy to be clearly audible at normal system volume
+# (the original 15ms/10ms bursts were nearly inaudible in practice).
 BURST1_START_S = 0.0
-BURST1_DURATION_S = 0.015
-BURST1_DECAY = 40.0  # higher = faster decay
-BURST1_AMPLITUDE = 0.9
+BURST1_DURATION_S = 0.055
+BURST1_DECAY = 14.0  # higher = faster decay
+BURST1_AMPLITUDE = 1.0
 
-# Burst 2: softer, starts ~50ms after burst 1.
-BURST2_START_S = 0.05
-BURST2_DURATION_S = 0.010
-BURST2_DECAY = 55.0
-BURST2_AMPLITUDE = 0.5
+# Burst 2: softer, starts ~80ms after burst 1.
+BURST2_START_S = 0.08
+BURST2_DURATION_S = 0.040
+BURST2_DECAY = 18.0
+BURST2_AMPLITUDE = 0.7
 
 
 def _burst_envelope(t: float, start: float, duration: float, decay: float) -> float:

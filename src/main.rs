@@ -15,6 +15,7 @@ mod settings;
 mod singleinstance;
 mod sound;
 mod startup;
+mod theme;
 mod toast;
 mod tray;
 

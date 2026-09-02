@@ -8,25 +8,28 @@
 //! instead of stacking a second window on screen.
 
 use std::ffi::c_void;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{PCWSTR, Result};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, SelectObject, SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DEFAULT_QUALITY, DT_CENTER, DT_VCENTER, DT_WORDBREAK, FF_DONTCARE, FW_NORMAL,
+    GetMonitorInfoW, InvalidateRect, MonitorFromPoint, SelectObject, SetBkMode, SetTextColor,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY, DT_CENTER, DT_VCENTER,
+    DT_WORDBREAK, FF_DONTCARE, FW_NORMAL, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-    RegisterClassW, SetLayeredWindowAttributes, SetTimer, ShowWindow, SystemParametersInfoW,
-    TranslateMessage, LWA_ALPHA, MSG, SPI_GETWORKAREA, SW_SHOWNOACTIVATE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    KillTimer, RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow,
+    TranslateMessage, LWA_ALPHA, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::config::ClickAction;
@@ -55,6 +58,10 @@ static TOAST_CLICK: Mutex<Option<ClickTarget>> = Mutex::new(None);
 /// Guards one-time registration of the toast window class.
 static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
 
+/// DPI the currently-shown toast was last positioned for, so `paint()` can
+/// scale its font without recomputing monitor info on every `WM_PAINT`.
+static TOAST_DPI: Mutex<u32> = Mutex::new(96);
+
 /// Shows (or updates) the toast with `text`. Safe to call repeatedly and
 /// rapidly — a visible toast has its text replaced and timer restarted
 /// rather than a new window being stacked on top.
@@ -69,7 +76,13 @@ pub fn show(text: &str) {
     let existing = *TOAST_HWND.lock().unwrap();
     if let Some(raw) = existing {
         let hwnd = HWND(raw as *mut c_void);
+        // Pitfall 7 fix: recompute position/size for the CURRENT cursor
+        // monitor/DPI so a reused toast never shows at a stale position
+        // after the user moved to a different monitor.
+        let (x, y, w, h, dpi) = compute_position();
+        *TOAST_DPI.lock().unwrap() = dpi;
         unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, true);
             let _ = SetTimer(
                 Some(hwnd),
@@ -84,7 +97,7 @@ pub fn show(text: &str) {
     if let Some(hwnd) = create_toast_window() {
         *TOAST_HWND.lock().unwrap() = Some(hwnd.0 as isize);
         unsafe {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 230, LWA_ALPHA);
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), constants::TOAST_ALPHA, LWA_ALPHA);
             let _ = SetTimer(
                 Some(hwnd),
                 constants::TOAST_TIMER_ID,
@@ -143,9 +156,8 @@ fn register_class_once() {
 }
 
 fn create_toast_window() -> Option<HWND> {
-    let work_area = get_work_area();
-    let x = work_area.right - constants::TOAST_WIDTH - constants::TOAST_MARGIN;
-    let y = work_area.bottom - constants::TOAST_HEIGHT - constants::TOAST_MARGIN;
+    let (x, y, w, h, dpi) = compute_position();
+    *TOAST_DPI.lock().unwrap() = dpi;
 
     let result: Result<HWND> = unsafe {
         let hinstance = GetModuleHandleW(None).expect("GetModuleHandleW failed");
@@ -157,15 +169,65 @@ fn create_toast_window() -> Option<HWND> {
             WS_POPUP,
             x,
             y,
-            constants::TOAST_WIDTH,
-            constants::TOAST_HEIGHT,
+            w,
+            h,
             None,
             None,
             Some(hinstance.into()),
             None,
         )
     };
+    if let Ok(hwnd) = result {
+        // Redundant with the CreateWindowExW position args above, but keeps
+        // the creation path and the show() reuse branch both going through
+        // SetWindowPos for the same top-center placement logic (Pitfall 7).
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     result.ok()
+}
+
+/// The work-area rect and effective DPI of the monitor under the cursor.
+/// Duplicated from `settings.rs::target_monitor_rect_and_dpi` verbatim --
+/// `toast.rs` is self-contained (PATTERNS.md "itself" analog).
+fn target_monitor_rect_and_dpi() -> (RECT, u32) {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetMonitorInfoW(hmon, &mut mi);
+    }
+    let (mut dx, mut dy) = (96u32, 96u32);
+    unsafe {
+        let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+    }
+    (mi.rcWork, dx)
+}
+
+/// Rounded integer scaling from the 96-DPI logical value `v` to the target
+/// `dpi`. Duplicated from `settings.rs::scale` for the same self-containment
+/// reason.
+fn scale(v: i32, dpi: u32) -> i32 {
+    (v * dpi as i32 + 48) / 96
+}
+
+/// Computes the top-center toast position/size for the cursor's current
+/// monitor and DPI: `(x, y, w, h, dpi)`. Top edge is `TOAST_TOP_OFFSET_LOGICAL`
+/// (0.5in) below the work area's top edge, horizontally centered.
+fn compute_position() -> (i32, i32, i32, i32, u32) {
+    let (work, dpi) = target_monitor_rect_and_dpi();
+    let w = scale(constants::TOAST_WIDTH, dpi);
+    let h = scale(constants::TOAST_HEIGHT, dpi);
+    let y = work.top + scale(constants::TOAST_TOP_OFFSET_LOGICAL, dpi);
+    let x = work.left + (work.right - work.left - w) / 2;
+    (x, y, w, h, dpi)
 }
 
 /// D-14 `open_file`: opens `path` with its default associated app, mirroring
@@ -208,19 +270,6 @@ fn reveal_in_explorer(path: &Path) {
     }
 }
 
-fn get_work_area() -> RECT {
-    let mut rect = RECT::default();
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut rect as *mut RECT as *mut c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-    }
-    rect
-}
-
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -229,10 +278,11 @@ unsafe fn paint(hwnd: HWND) {
     unsafe { FillRect(hdc, &ps.rcPaint, background) };
     let _ = unsafe { DeleteObject(background.into()) };
 
+    let dpi = *TOAST_DPI.lock().unwrap();
     let font_name = constants::to_wide("Segoe UI");
     let font = unsafe {
         CreateFontW(
-            18,
+            -((constants::TOAST_FONT_HEIGHT_LOGICAL * dpi as i32) / 96),
             0,
             0,
             0,
@@ -250,7 +300,7 @@ unsafe fn paint(hwnd: HWND) {
     };
     let old_font = unsafe { SelectObject(hdc, font.into()) };
     unsafe { SetBkMode(hdc, TRANSPARENT) };
-    unsafe { SetTextColor(hdc, COLORREF(0x00E0E0E0)) };
+    unsafe { SetTextColor(hdc, COLORREF(constants::TOAST_TEXT_COLOR)) };
 
     let mut text_rect = ps.rcPaint;
     let text = TOAST_TEXT.lock().unwrap().clone();

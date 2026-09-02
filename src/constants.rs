@@ -60,14 +60,27 @@ pub const WM_APP_SAVE_DONE: u32 = WM_APP + 4;
 /// How long a toast stays visible before auto-dismissing (D-03).
 pub const TOAST_DURATION_MS: u32 = 2500;
 
-/// Toast window width in pixels.
-pub const TOAST_WIDTH: i32 = 320;
+/// Toast window width in pixels (96-DPI logical, scaled at use time).
+pub const TOAST_WIDTH: i32 = 420;
 
-/// Toast window height in pixels.
-pub const TOAST_HEIGHT: i32 = 72;
+/// Toast window height in pixels (96-DPI logical, scaled at use time).
+pub const TOAST_HEIGHT: i32 = 80;
 
-/// Margin from the work-area edge for toast placement.
-pub const TOAST_MARGIN: i32 = 16;
+/// Toast text color: green (UAT UI-06), packed via `rgb()`.
+pub const TOAST_TEXT_COLOR: u32 = rgb(100, 220, 80);
+
+/// `SetLayeredWindowAttributes` alpha for the toast window -- lower than the
+/// prior 230 for a more visibly translucent background (UAT UI-06).
+pub const TOAST_ALPHA: u8 = 195;
+
+/// Toast font character height in 96-DPI logical pixels, scaled by monitor
+/// DPI at paint time (UAT UI-06 "visibly larger").
+pub const TOAST_FONT_HEIGHT_LOGICAL: i32 = 28;
+
+/// Distance from the work-area top edge to the toast's top edge, in 96-DPI
+/// logical pixels (48px at 96dpi = 0.5in), scaled by monitor DPI at
+/// placement time (UAT UI-06 "top-center ~0.5in down").
+pub const TOAST_TOP_OFFSET_LOGICAL: i32 = 48;
 
 /// Timer id used for the toast auto-dismiss `SetTimer` call.
 pub const TOAST_TIMER_ID: usize = 1;

@@ -232,7 +232,7 @@ pub const SETTINGS_CLIENT_W: i32 = 400;
 ///
 /// Not yet consumed: layout code arrives in a later Phase 4 plan.
 #[allow(dead_code)]
-pub const SETTINGS_CLIENT_H: i32 = 460;
+pub const SETTINGS_CLIENT_H: i32 = 528;
 
 /// Inline validation/error hint auto-dismiss duration (D-45/D-46/D-48/D-52).
 ///
@@ -288,6 +288,8 @@ pub const ID_CLIPBOARD_CHECK: i32 = 112;
 pub const ID_STARTUP_CHECK: i32 = 113;
 #[allow(dead_code)]
 pub const ID_STARTUP_HINT: i32 = 114;
+pub const ID_SHUTTER_CHECK: i32 = 115;
+pub const ID_DONE_BTN: i32 = 116;
 
 // ---------------------------------------------------------------------
 // Helpers

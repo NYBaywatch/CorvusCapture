@@ -13,6 +13,7 @@ mod overlay;
 mod save;
 mod settings;
 mod singleinstance;
+mod sound;
 mod startup;
 mod toast;
 mod tray;

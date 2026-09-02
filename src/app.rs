@@ -23,6 +23,7 @@ use crate::hotkeys;
 use crate::overlay;
 use crate::settings;
 use crate::singleinstance;
+use crate::sound;
 use crate::toast;
 use crate::tray;
 use crate::{capture, clipboard, config, save};
@@ -58,6 +59,9 @@ fn run_capture(source: CaptureSource) {
                     return;
                 }
             };
+            if cfg.shutter_sound {
+                sound::play_shutter();
+            }
             (bitmap, None)
         }
         CaptureSource::ActiveWindow => {
@@ -87,6 +91,9 @@ fn run_capture(source: CaptureSource) {
                     return;
                 }
             };
+            if cfg.shutter_sound {
+                sound::play_shutter();
+            }
             // D-22: the "two monitors" wording stays literal even for 3+.
             let advisory = if capture::monitor_span_count(rect) > 1 {
                 Some(

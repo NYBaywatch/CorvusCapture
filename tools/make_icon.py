@@ -15,7 +15,7 @@ Requires: Pillow (`pip install pillow`)
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 SIZES = [16, 32, 48, 256]
 CANVAS = 256
@@ -49,8 +49,23 @@ def draw_crow(size: int) -> Image.Image:
     return img
 
 
+def add_white_outline(img: Image.Image) -> Image.Image:
+    """Composites a white ring around `img`'s silhouette so the crow reads
+    clearly against a dark taskbar at real 16x16 tray size (RESEARCH.md
+    Pattern 2). Dilates the alpha channel with a MaxFilter to build the ring
+    mask, then alpha-composites the original black crow back on top."""
+    alpha = img.split()[3]
+    dilated_alpha = alpha.filter(ImageFilter.MaxFilter(13))
+
+    white_ring = Image.new("RGBA", img.size, (255, 255, 255, 0))
+    white_ring.putalpha(dilated_alpha)
+
+    return Image.alpha_composite(white_ring, img)
+
+
 def main() -> None:
     base = draw_crow(CANVAS)
+    base = add_white_outline(base)
     frames = []
     for size in SIZES:
         if size == CANVAS:

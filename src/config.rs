@@ -91,6 +91,7 @@ pub struct Config {
     pub clipboard_enabled: bool,
     pub toast_click_action: String,
     pub start_with_windows: bool, // D-50/D-51
+    pub shutter_sound: bool, // UI-05
 }
 
 impl Default for Config {
@@ -105,6 +106,7 @@ impl Default for Config {
             clipboard_enabled: false,  // D-12
             toast_click_action: "dismiss".to_string(), // D-14
             start_with_windows: false, // D-50/D-51
+            shutter_sound: false, // UI-05
         }
     }
 }

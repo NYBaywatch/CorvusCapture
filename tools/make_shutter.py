@@ -37,6 +37,16 @@ BURST2_DURATION_S = 0.040
 BURST2_DECAY = 18.0
 BURST2_AMPLITUDE = 0.7
 
+# Timbre shaping: raw white noise sounds like a knock on wood. A camera
+# shutter is bright and metallic, so the noise is high-pass filtered
+# (removing the low "thump" content) and each burst gets a short damped
+# sine "ping" that adds the metallic mechanism character.
+HIGHPASS_ALPHA = 0.85  # one-pole high-pass coefficient (higher = brighter)
+PING1_FREQ_HZ = 4200.0
+PING1_AMPLITUDE = 0.45
+PING2_FREQ_HZ = 2800.0
+PING2_AMPLITUDE = 0.35
+
 
 def _burst_envelope(t: float, start: float, duration: float, decay: float) -> float:
     """Returns the envelope amplitude at time `t` for a burst starting at
@@ -52,19 +62,44 @@ def _burst_envelope(t: float, start: float, duration: float, decay: float) -> fl
 def synthesize() -> bytes:
     random.seed(42)  # deterministic output across regenerations
     n_samples = int(SAMPLE_RATE * TOTAL_DURATION_S)
-    samples = bytearray()
+    values = []
+    prev_noise = 0.0
+    hp_noise_prev = 0.0
     for i in range(n_samples):
         t = i / SAMPLE_RATE
-        env = BURST1_AMPLITUDE * _burst_envelope(
-            t, BURST1_START_S, BURST1_DURATION_S, BURST1_DECAY
-        ) + BURST2_AMPLITUDE * _burst_envelope(
-            t, BURST2_START_S, BURST2_DURATION_S, BURST2_DECAY
-        )
+        env1 = _burst_envelope(t, BURST1_START_S, BURST1_DURATION_S, BURST1_DECAY)
+        env2 = _burst_envelope(t, BURST2_START_S, BURST2_DURATION_S, BURST2_DECAY)
+
+        # One-pole high-pass filtered noise: bright "tsk" instead of a
+        # low knock. y[i] = a*(y[i-1] + x[i] - x[i-1])
         noise = random.uniform(-1.0, 1.0)
-        value = noise * env
-        # Clamp and convert to 16-bit signed PCM.
-        value = max(-1.0, min(1.0, value))
-        sample = int(value * 32767)
+        hp_noise = HIGHPASS_ALPHA * (hp_noise_prev + noise - prev_noise)
+        prev_noise = noise
+        hp_noise_prev = hp_noise
+
+        value = hp_noise * (BURST1_AMPLITUDE * env1 + BURST2_AMPLITUDE * env2)
+
+        # Damped sine pings, one per burst, for the metallic mechanism tone.
+        if env1 > 0.0:
+            value += (
+                PING1_AMPLITUDE
+                * env1
+                * math.sin(2.0 * math.pi * PING1_FREQ_HZ * (t - BURST1_START_S))
+            )
+        if env2 > 0.0:
+            value += (
+                PING2_AMPLITUDE
+                * env2
+                * math.sin(2.0 * math.pi * PING2_FREQ_HZ * (t - BURST2_START_S))
+            )
+        values.append(value)
+
+    # Normalize to ~90% full scale so loudness is stable across tweaks.
+    peak = max(abs(v) for v in values) or 1.0
+    scale = 0.9 / peak
+    samples = bytearray()
+    for value in values:
+        sample = int(max(-1.0, min(1.0, value * scale)) * 32767)
         samples += sample.to_bytes(2, byteorder="little", signed=True)
     return bytes(samples)
 

@@ -14,21 +14,23 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, MonitorFromRect,
-    COLOR_BTNFACE, HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    CreateFontIndirectW, DeleteObject, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint,
+    MonitorFromRect, SetBkColor, SetBkMode, SetTextColor, COLOR_BTNFACE, HBRUSH, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, BST_CHECKED, BST_UNCHECKED, EM_SETLIMITTEXT, EM_SETSEL,
-    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, TBM_SETPAGESIZE,
-    TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN, TBM_SETTICFREQ, TBS_AUTOTICKS, TBS_HORZ,
-    TB_THUMBTRACK, TRACKBAR_CLASS, WC_BUTTONW, WC_COMBOBOXW, WC_EDITW, WC_STATICW,
+    GetComboBoxInfo, InitCommonControlsEx, SetWindowTheme, BST_CHECKED, BST_UNCHECKED,
+    COMBOBOXINFO, EM_SETLIMITTEXT, EM_SETSEL, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES,
+    INITCOMMONCONTROLSEX, TBM_SETPAGESIZE, TBM_SETPOS, TBM_SETRANGEMAX, TBM_SETRANGEMIN,
+    TBM_SETTICFREQ, TBS_AUTOTICKS, TBS_HORZ, TB_THUMBTRACK, TRACKBAR_CLASS, WC_BUTTONW,
+    WC_COMBOBOXW, WC_EDITW, WC_STATICW,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, SystemParametersInfoForDpi, MDT_EFFECTIVE_DPI,
@@ -40,24 +42,25 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
-    GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
-    IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK,
-    BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetClientRect, GetCursorPos,
+    GetDlgItem, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    IsDialogMessageW, IsIconic, IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow,
+    RegisterClassW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
     CBN_SELCHANGE, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
-    EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL, HMENU, IDCANCEL,
-    IDC_ARROW, IDOK, MB_OK, MSG, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED,
-    WM_HSCROLL, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE,
-    WINDOW_STYLE,
+    EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL, FLASHWINFO, FLASHW_ALL, HMENU,
+    IDCANCEL, IDC_ARROW, IDOK, MB_OK, MSG, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_HSCROLL,
+    WM_SETFONT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 use crate::config::{self, Config, Format};
 use crate::constants;
 use crate::save;
 use crate::startup;
+use crate::theme;
 use crate::toast;
 
 /// `TBM_GETPOS` is not exported by `windows` 0.62.2 (grep of the whole
@@ -432,6 +435,12 @@ fn create_and_show() {
     populate(hwnd);
     with_state(|d| d.initializing = false);
 
+    // UI-03: apply dark theming (title bar + per-control) before the
+    // window is ever shown, so there is no light-then-dark flash.
+    let dark = theme::is_dark();
+    theme::apply_titlebar(hwnd, dark);
+    apply_control_themes(hwnd, dark);
+
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
@@ -638,6 +647,62 @@ fn layout(hwnd: HWND, dpi: u32) {
                 scale(h, dpi),
                 true,
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Dark theme (UI-03)
+// ---------------------------------------------------------------------
+
+/// Applies (or removes) per-control dark theming across every push button,
+/// EDIT, and COMBOBOX (including its dropdown list) per RESEARCH Pattern
+/// 1's mechanism table. Shared by `create_and_show` (before `ShowWindow`)
+/// and the `WM_SETTINGCHANGE` handler so the control list is never
+/// duplicated. Passing `dark = false` restores stock theming via a null
+/// `SetWindowTheme` call, so a live theme-change back to light fully
+/// undoes the dark-mode classes.
+fn apply_control_themes(hwnd: HWND, dark: bool) {
+    let dark_explorer = w!("DarkMode_Explorer");
+    let dark_cfd = w!("DarkMode_CFD");
+    let stock = PCWSTR::null();
+
+    for id in [constants::ID_BROWSE_BTN, constants::ID_DONE_BTN] {
+        if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+            unsafe {
+                let _ = SetWindowTheme(ctrl, if dark { dark_explorer } else { stock }, stock);
+            }
+        }
+    }
+
+    for id in [
+        constants::ID_BASE_EDIT,
+        constants::ID_FOLDER_EDIT,
+        constants::ID_FORMAT_COMBO,
+        constants::ID_CLICK_ACTION_COMBO,
+    ] {
+        if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+            unsafe {
+                let _ = SetWindowTheme(ctrl, if dark { dark_cfd } else { stock }, stock);
+            }
+        }
+    }
+
+    for id in [constants::ID_FORMAT_COMBO, constants::ID_CLICK_ACTION_COMBO] {
+        if let Ok(combo) = unsafe { GetDlgItem(Some(hwnd), id) } {
+            let mut info = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetComboBoxInfo(combo, &mut info) }.is_ok() && !info.hwndList.0.is_null() {
+                unsafe {
+                    let _ = SetWindowTheme(
+                        info.hwndList,
+                        if dark { dark_explorer } else { stock },
+                        stock,
+                    );
+                }
+            }
         }
     }
 }
@@ -1399,6 +1464,64 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             LRESULT(0)
         }
+        WM_ERASEBKGND => {
+            if theme::is_dark() {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                let mut rect = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    FillRect(hdc, &rect, theme::dark_window_brush());
+                }
+                LRESULT(1)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_CTLCOLORSTATIC => {
+            if theme::is_dark() {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, theme::text_color());
+                    let _ = SetBkMode(hdc, TRANSPARENT);
+                }
+                LRESULT(theme::dark_control_brush().0 as isize)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            if theme::is_dark() {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    let _ = SetTextColor(hdc, theme::text_color());
+                    let _ = SetBkColor(hdc, COLORREF(theme::CONTROL_BG));
+                }
+                LRESULT(theme::dark_control_brush().0 as isize)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_SETTINGCHANGE => {
+            // Pitfall 6 (mirrors the WM_DPICHANGED null-check below): many
+            // WM_SETTINGCHANGE broadcasts carry a null lparam; only read it
+            // as a PCWSTR when it isn't.
+            let str_ptr = lparam.0 as *const u16;
+            if !str_ptr.is_null() {
+                let setting = unsafe { PCWSTR(str_ptr).to_string() }.unwrap_or_default();
+                if setting == "ImmersiveColorSet" {
+                    theme::refresh();
+                    let dark = theme::is_dark();
+                    theme::apply_titlebar(hwnd, dark);
+                    apply_control_themes(hwnd, dark);
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                }
+            }
+            // Always fall through: other top-level windows still need this
+            // broadcast's default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_DPICHANGED => {
             // T-01-04: never dereference a caller-supplied pointer without
             // a guard. Any local process can forge this message with
@@ -1487,6 +1610,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
             }
             *SETTINGS_HWND.lock().unwrap() = None;
+            // T-04.1-07: the window is gone, so the cached theme brushes
+            // have nothing left to paint -- free them now rather than
+            // leaking two GDI handles until the next Settings open.
+            theme::teardown();
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

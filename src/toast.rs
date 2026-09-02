@@ -17,7 +17,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
     GetMonitorInfoW, InvalidateRect, MonitorFromPoint, SelectObject, SetBkMode, SetTextColor,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY, DT_CENTER, DT_VCENTER,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DEFAULT_QUALITY, DT_CALCRECT, DT_CENTER,
     DT_WORDBREAK, FF_DONTCARE, FW_NORMAL, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
@@ -308,13 +308,23 @@ unsafe fn paint(hwnd: HWND) {
     // DrawTextW takes the buffer length excluding the trailing NUL when a
     // positive count is supplied; -1 also works but pop the NUL to be explicit.
     wide_text.pop();
+    // WR-04: DT_VCENTER has no effect combined with DT_WORDBREAK -- measure
+    // the wrapped text height with DT_CALCRECT first, then offset the draw
+    // rect to center it vertically within the paint rect.
+    let mut calc_rect = RECT {
+        left: text_rect.left,
+        top: 0,
+        right: text_rect.right,
+        bottom: 0,
+    };
     unsafe {
-        DrawTextW(
-            hdc,
-            &mut wide_text,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_WORDBREAK,
-        )
+        DrawTextW(hdc, &mut wide_text, &mut calc_rect, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+    };
+    let text_h = calc_rect.bottom - calc_rect.top;
+    let avail_h = text_rect.bottom - text_rect.top;
+    text_rect.top += ((avail_h - text_h) / 2).max(0);
+    unsafe {
+        DrawTextW(hdc, &mut wide_text, &mut text_rect, DT_CENTER | DT_WORDBREAK)
     };
 
     unsafe { SelectObject(hdc, old_font) };

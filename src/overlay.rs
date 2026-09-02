@@ -1186,6 +1186,9 @@ fn confirm(hwnd: HWND) {
     }
 
     let cfg = config::load(); // D-11: re-read at action time, like run_capture.
+    if cfg.shutter_sound {
+        crate::sound::play_shutter();
+    }
     if cfg.clipboard_enabled {
         // D-16: failure is non-fatal -- the file save proceeds regardless.
         let _ = clipboard::copy_dib(&cropped);

@@ -66,9 +66,6 @@ pub const TOAST_WIDTH: i32 = 420;
 /// Toast window height in pixels (96-DPI logical, scaled at use time).
 pub const TOAST_HEIGHT: i32 = 80;
 
-/// Margin from the work-area edge for toast placement.
-pub const TOAST_MARGIN: i32 = 16;
-
 /// Toast text color: green (UAT UI-06), packed via `rgb()`.
 pub const TOAST_TEXT_COLOR: u32 = rgb(100, 220, 80);
 

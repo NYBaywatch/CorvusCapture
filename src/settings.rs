@@ -302,6 +302,25 @@ fn saved_position_rect_and_dpi(cfg: &Config) -> Option<(RECT, u32)> {
         return None;
     }
 
+    // WR-01: MonitorFromRect(MONITOR_DEFAULTTONULL) validates on *any*
+    // pixel of overlap, so a rect that barely grazes a monitor (e.g. after
+    // an external monitor is removed/resized) would still pass. Require a
+    // title-bar-sized area of the window to actually fall within that
+    // monitor's work area before trusting the saved position.
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let _ = GetMonitorInfoW(validate_hmon, &mut mi);
+    }
+    const MIN_VISIBLE_PX: i32 = 100;
+    let visible_w = rect.right.min(mi.rcWork.right).saturating_sub(rect.left.max(mi.rcWork.left));
+    let visible_h = rect.bottom.min(mi.rcWork.bottom).saturating_sub(rect.top.max(mi.rcWork.top));
+    if visible_w < MIN_VISIBLE_PX || visible_h < MIN_VISIBLE_PX {
+        return None;
+    }
+
     Some((rect, dx))
 }
 

@@ -1525,12 +1525,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_SETTINGCHANGE => {
             // Pitfall 6 (mirrors the WM_DPICHANGED null-check below): many
-            // WM_SETTINGCHANGE broadcasts carry a null lparam; only read it
-            // as a PCWSTR when it isn't.
+            // WM_SETTINGCHANGE broadcasts carry a null lparam, and (like
+            // WM_DPICHANGED) any local process can forge this message with
+            // an arbitrary non-null but invalid lparam. WR-03: bound the
+            // read to the expected "ImmersiveColorSet" length instead of
+            // PCWSTR::to_string()'s unbounded NUL-terminated memory walk.
             let str_ptr = lparam.0 as *const u16;
             if !str_ptr.is_null() {
-                let setting = unsafe { PCWSTR(str_ptr).to_string() }.unwrap_or_default();
-                if setting == "ImmersiveColorSet" {
+                const EXPECTED: &str = "ImmersiveColorSet";
+                let bounded = unsafe { std::slice::from_raw_parts(str_ptr, EXPECTED.len() + 1) };
+                let is_expected = bounded[EXPECTED.len()] == 0
+                    && String::from_utf16_lossy(&bounded[..EXPECTED.len()]) == EXPECTED;
+                if is_expected {
                     theme::refresh();
                     let dark = theme::is_dark();
                     theme::apply_titlebar(hwnd, dark);

@@ -91,6 +91,9 @@ pub struct Config {
     pub clipboard_enabled: bool,
     pub toast_click_action: String,
     pub start_with_windows: bool, // D-50/D-51
+    pub window_x: Option<i32>, // D-window-position, UI-01
+    pub window_y: Option<i32>, // D-window-position, UI-01
+    pub shutter_sound: bool, // D-shutter-toggle, UI-05
 }
 
 impl Default for Config {
@@ -105,6 +108,9 @@ impl Default for Config {
             clipboard_enabled: false,  // D-12
             toast_click_action: "dismiss".to_string(), // D-14
             start_with_windows: false, // D-50/D-51
+            window_x: None,
+            window_y: None,
+            shutter_sound: false,
         }
     }
 }
@@ -306,6 +312,15 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(!cfg.start_with_windows);
         assert_eq!(cfg.version, 1);
+    }
+
+    #[test]
+    fn window_position_and_shutter_sound_missing_keys_deserialize_to_defaults() {
+        let json = r#"{"version":1,"base_filename":"corvus"}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.window_x, None);
+        assert_eq!(cfg.window_y, None);
+        assert!(!cfg.shutter_sound);
     }
 
     #[test]

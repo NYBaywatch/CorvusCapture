@@ -17,8 +17,8 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, COLOR_BTNFACE,
-    HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    CreateFontIndirectW, DeleteObject, GetMonitorInfoW, MonitorFromPoint, MonitorFromRect,
+    COLOR_BTNFACE, HBRUSH, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -41,7 +41,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, FlashWindowEx, GetCursorPos, GetDlgItem,
-    GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
+    GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsIconic,
     IsWindow, KillTimer, LoadCursorW, LoadIconW, MoveWindow, RegisterClassW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK,
     BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_GROUPBOX, BS_PUSHBUTTON,
@@ -257,6 +257,48 @@ fn window_rect_centered(
     }
 }
 
+/// Computes the top-level window rect for a saved `(cfg.window_x,
+/// cfg.window_y)` top-left position, at the DPI of the monitor under that
+/// point, validated against currently-connected monitors (D-window-position,
+/// UI-01). Returns `None` whenever either coordinate is unset, or the saved
+/// position no longer intersects any connected monitor (Pitfall 5) -- the
+/// caller falls back to the existing cursor-monitor-centered placement
+/// (D-40) in either case.
+fn saved_position_rect_and_dpi(cfg: &Config) -> Option<(RECT, u32)> {
+    let (x, y) = (cfg.window_x?, cfg.window_y?);
+
+    let pt = POINT { x, y };
+    let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    let (mut dx, mut dy) = (96u32, 96u32);
+    unsafe {
+        let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+    }
+
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: scale(constants::SETTINGS_CLIENT_W, dx),
+        bottom: scale(constants::SETTINGS_CLIENT_H, dx),
+    };
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut r, WINDOW_STYLE_FLAGS, false, Default::default(), dx);
+    }
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+
+    let validate_hmon = unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) };
+    if validate_hmon.0.is_null() {
+        return None;
+    }
+
+    Some((rect, dx))
+}
+
 /// Builds the system message font (`SPI_GETNONCLIENTMETRICS.lfMessageFont`)
 /// for `dpi` -- the dialog-convention font (never a hardcoded "Segoe UI"
 /// font-by-name create call, that is the toast/overlay convention).
@@ -327,15 +369,21 @@ fn create_and_show() {
     // 04-04 must never call config::load() again while this window lives.
     let cfg = config::load();
 
-    let (work, dpi) = target_monitor_rect_and_dpi();
-    let rect = window_rect_centered(
-        constants::SETTINGS_CLIENT_W,
-        constants::SETTINGS_CLIENT_H,
-        work,
-        dpi,
-        WINDOW_STYLE_FLAGS,
-        Default::default(),
-    );
+    let (rect, dpi) = match saved_position_rect_and_dpi(&cfg) {
+        Some((rect, dpi)) => (rect, dpi),
+        None => {
+            let (work, dpi) = target_monitor_rect_and_dpi();
+            let rect = window_rect_centered(
+                constants::SETTINGS_CLIENT_W,
+                constants::SETTINGS_CLIENT_H,
+                work,
+                dpi,
+                WINDOW_STYLE_FLAGS,
+                Default::default(),
+            );
+            (rect, dpi)
+        }
+    };
 
     let class_name = constants::to_wide(constants::SETTINGS_WINDOW_CLASS);
     let title = constants::to_wide(constants::SETTINGS_WINDOW_TITLE);
@@ -462,13 +510,15 @@ fn ctrl_specs() -> Vec<Spec> {
         Spec { id: constants::ID_QUALITY_LABEL, class: WC_STATICW, caption: "JPG &quality:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 236, w: 88, h: 16, create_h: None },
         Spec { id: constants::ID_QUALITY_SLIDER, class: TRACKBAR_CLASS, caption: "", extra_style: TBS_HORZ | TBS_AUTOTICKS, tabstop: true, x: 120, y: 232, w: 200, h: 24, create_h: None },
         Spec { id: constants::ID_QUALITY_VALUE, class: WC_STATICW, caption: "", extra_style: SS_LEFT.0, tabstop: false, x: 328, y: 236, w: 48, h: 16, create_h: None },
-        Spec { id: GRP_BEHAVIOR, class: WC_BUTTONW, caption: "Behavior", extra_style: BS_GROUPBOX as u32, tabstop: false, x: 12, y: 284, w: 376, h: 164, create_h: None },
+        Spec { id: GRP_BEHAVIOR, class: WC_BUTTONW, caption: "Behavior", extra_style: BS_GROUPBOX as u32, tabstop: false, x: 12, y: 284, w: 376, h: 192, create_h: None },
         Spec { id: constants::ID_TOAST_CHECK, class: WC_BUTTONW, caption: "Show a &toast after each save", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 308, w: 352, h: 20, create_h: None },
         Spec { id: LBL_CLICK_ACTION, class: WC_STATICW, caption: "&When clicking the save toast:", extra_style: SS_LEFT.0, tabstop: false, x: 24, y: 340, w: 176, h: 16, create_h: None },
         Spec { id: constants::ID_CLICK_ACTION_COMBO, class: WC_COMBOBOXW, caption: "", extra_style: CBS_DROPDOWNLIST as u32, tabstop: true, x: 208, y: 336, w: 168, h: 24, create_h: Some(104) },
         Spec { id: constants::ID_CLIPBOARD_CHECK, class: WC_BUTTONW, caption: "&Copy each capture to the clipboard", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 368, w: 352, h: 20, create_h: None },
         Spec { id: constants::ID_STARTUP_CHECK, class: WC_BUTTONW, caption: "Start with &Windows", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 396, w: 352, h: 20, create_h: None },
         Spec { id: constants::ID_STARTUP_HINT, class: WC_STATICW, caption: "", extra_style: SS_NOPREFIX.0, tabstop: false, x: 24, y: 420, w: 352, h: 16, create_h: None },
+        Spec { id: constants::ID_SHUTTER_CHECK, class: WC_BUTTONW, caption: "Play a &shutter sound on capture", extra_style: BS_AUTOCHECKBOX as u32, tabstop: true, x: 24, y: 444, w: 352, h: 20, create_h: None },
+        Spec { id: constants::ID_DONE_BTN, class: WC_BUTTONW, caption: "&Done", extra_style: BS_PUSHBUTTON as u32, tabstop: true, x: 300, y: 488, w: 88, h: 28, create_h: None },
     ]
 }
 
@@ -751,6 +801,7 @@ fn populate(hwnd: HWND) {
     set_check(hwnd, constants::ID_CLIPBOARD_CHECK, cfg.clipboard_enabled);
     // D-51: the checkbox reflects the registry, not the config flag.
     set_check(hwnd, constants::ID_STARTUP_CHECK, startup::is_registered());
+    set_check(hwnd, constants::ID_SHUTTER_CHECK, cfg.shutter_sound);
 
     apply_format_visibility(hwnd, fmt);
     refresh_preview(hwnd, &cfg);
@@ -831,6 +882,12 @@ fn handle_command(hwnd: HWND, wparam: WPARAM) {
         (BN_CLICKED, cid) if cid == constants::ID_STARTUP_CHECK => {
             handle_startup_toggle(hwnd);
         }
+        (BN_CLICKED, cid) if cid == constants::ID_SHUTTER_CHECK => {
+            let checked = get_check(hwnd, cid);
+            with_state(|d| d.cfg.shutter_sound = checked);
+            persist();
+        }
+        (BN_CLICKED, cid) if cid == constants::ID_DONE_BTN => close(hwnd),
         (BN_CLICKED, cid) if cid == constants::ID_BROWSE_BTN => {
             handle_browse(hwnd);
         }
@@ -1196,6 +1253,27 @@ fn close(hwnd: HWND) {
     }
     commit_base_filename(hwnd);
     commit_folder(hwnd);
+
+    // D-window-position/UI-01: capture the window's current top-left and
+    // persist only when it actually changed (skip-unchanged, WR-04
+    // precedent) -- never persist on every close.
+    let mut rect = RECT::default();
+    let got_rect = unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok();
+    if got_rect {
+        let changed = with_state(|d| {
+            if d.cfg.window_x == Some(rect.left) && d.cfg.window_y == Some(rect.top) {
+                return false;
+            }
+            d.cfg.window_x = Some(rect.left);
+            d.cfg.window_y = Some(rect.top);
+            true
+        })
+        .unwrap_or(false);
+        if changed {
+            persist();
+        }
+    }
+
     unsafe {
         let _ = DestroyWindow(hwnd);
     }
@@ -1234,7 +1312,7 @@ fn read_text(hwnd: HWND, id: i32) -> String {
 
 /// Every addressable (`ID_*`) control the window creates -- the exact set
 /// `--settings-selftest` proves exists via `GetDlgItem`.
-const ALL_CONTROL_IDS: [i32; 15] = [
+const ALL_CONTROL_IDS: [i32; 17] = [
     constants::ID_BASE_EDIT,
     constants::ID_BASE_HINT,
     constants::ID_FOLDER_EDIT,
@@ -1250,6 +1328,8 @@ const ALL_CONTROL_IDS: [i32; 15] = [
     constants::ID_CLIPBOARD_CHECK,
     constants::ID_STARTUP_CHECK,
     constants::ID_STARTUP_HINT,
+    constants::ID_SHUTTER_CHECK,
+    constants::ID_DONE_BTN,
 ];
 
 /// Dev-only (`--settings-selftest`, main.rs): opens the window, asserts

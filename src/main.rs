@@ -14,6 +14,7 @@ mod save;
 mod settings;
 mod singleinstance;
 mod sound;
+mod splash;
 mod startup;
 mod theme;
 mod toast;
@@ -209,6 +210,14 @@ fn main() {
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
     theme::enable_dark_context_menus();
+
+    // Startup splash: shows the logo for ~2.5s so the user knows the app
+    // launched. Independent of the tray -- `show()` only creates a window
+    // and returns (no message pump call here), so it cannot delay hotkey
+    // registration below. Never called from the selftest/CLI branches
+    // above, all of which exit before reaching this point.
+    splash::show();
+
     let _tray = tray::init().expect("failed to create tray icon");
 
     // Phase 2 startup: the orphan `.tmp` sweep must finish and the save

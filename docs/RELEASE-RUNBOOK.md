@@ -52,10 +52,21 @@ running `gc --aggressive` or deleting `refs/original/` after any history rewrite
 3. Document the SmartScreen "More info -> Run anyway" bypass for early adopters in the
    release notes and README, conditioned on checksum verification first.
 
+**Decision superseded (2026-09-03, same day):** After initial publication, the maintainer's
+existing **Azure Trusted Signing** account (already used for AgrusScanner) was applied to this
+project — a pay-per-use signing service with none of the EV-certificate cost/vetting burden
+the analysis above rejected. `CorvusCapture.exe` was Authenticode-signed
+(signer `CN=Joseph Fago, O=Joseph Fago, L=Newark, S=New Jersey, C=US`, timestamped) and the
+v0.1.0 release assets were replaced in place with the signed binary and its new checksum.
+The compensating controls below (checksums, Microsoft submissions, MOTW test) remain valid
+but are now defense-in-depth rather than the primary mitigation; SmartScreen reputation for
+Trusted Signing-signed binaries accrues substantially faster than for unsigned ones.
+
 **v0.1.0 release details:**
 
-- Date: 2026-09-03
-- SHA-256: `37B5D8816C9BB7D8A5803BDDE2AD39BC53BEE98FB3A13F614796E2161F4D546F`
+- Date: 2026-09-03 (assets replaced same day with the Trusted Signing-signed binary)
+- SHA-256 (signed exe): `FA242C711F4BCDEE802966F371AF2675AF3C8745F0772C655E61CBBF24365F63`
+- Signature: Azure Trusted Signing, `CN=Joseph Fago`, verify via `Get-AuthenticodeSignature`
 - Release: https://github.com/NYBaywatch/CorvusCapture/releases/tag/v0.1.0
 
 ## Post-publish Microsoft submissions (manual)
@@ -106,7 +117,11 @@ zone identifier and will not reproduce the SmartScreen condition a real download
    ```
    certutil -hashfile CorvusCapture.exe SHA256
    ```
-   Compare the output to `37B5D8816C9BB7D8A5803BDDE2AD39BC53BEE98FB3A13F614796E2161F4D546F`.
+   Compare the output to `FA242C711F4BCDEE802966F371AF2675AF3C8745F0772C655E61CBBF24365F63`
+   (the signed binary), and confirm the digital signature is valid:
+   ```
+   Get-AuthenticodeSignature CorvusCapture.exe
+   ```
 4. Run the exe. Record whether Microsoft Defender flags it, and exactly what SmartScreen
    shows (if anything).
 5. If SmartScreen appears, click `More info`, then `Run anyway`, and confirm the tray icon

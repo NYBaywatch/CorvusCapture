@@ -3,6 +3,23 @@
 This document records the code-signing decision for Corvus Capture releases and the
 post-publish procedures that must be completed before a release is announced.
 
+## Warning: git history rewrites
+
+If a future release (or any other task) requires rewriting git history (`git filter-branch`,
+`git filter-repo`, BFG, etc.) — for example to purge a file that was force-tracked by
+mistake — do **not** proceed directly to dropping backup refs or running an aggressive gc.
+During v0.1.0's release hardening, running `git filter-branch` followed immediately by
+dropping `refs/original/` and `git gc --prune=now --aggressive`, *before* checking the
+working tree, permanently deleted 21 historical planning documents: `filter-branch`'s final
+step is a `git checkout -f` of the rewritten HEAD, which also removes any working-tree files
+that were purged from the rewritten history, not just their tracked/history copies. Before
+running `gc --aggressive` or deleting `refs/original/` after any history rewrite:
+
+1. Create a backup branch or tag of the pre-rewrite tip (e.g. `git branch backup-pre-rewrite <old-sha>`).
+2. Run `git status` and diff the working tree against the pre-rewrite state to confirm no
+   unexpected files were removed from disk.
+3. Only after both checks pass, drop `refs/original/` and run `gc --aggressive`.
+
 ## Code-signing decision (v0.1.0)
 
 **Decision: no certificate.** Corvus Capture v0.1.0 ships unsigned.
@@ -19,9 +36,11 @@ post-publish procedures that must be completed before a release is announced.
   the same "Windows protected your PC" reputation-based warning until enough
   downloads/time accrue reputation for that binary. Paying for an OV cert would therefore
   add cost without removing the SmartScreen prompt users actually see.
-  *(This EV-vs-OV distinction is treated as an assumption to re-verify — see
-  `.planning/phases/05-release-hardening-distribution/05-RESEARCH.md` Assumption A2 — if
-  code-signing is reconsidered for a future release.)*
+  *(This EV-vs-OV distinction was researched during v0.1.0 planning and should be
+  re-verified against current Microsoft policy if code-signing is reconsidered for a
+  future release — Microsoft has changed SmartScreen reputation rules before and may do
+  so again. The original research notes were part of local, gitignored planning history
+  and are not part of this repository.)*
 
 **Executed alternative (compensating controls):**
 

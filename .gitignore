@@ -4,3 +4,7 @@
 /target
 
 # .planning/ is intentionally local-only: GSD workflow artifacts, never published.
+
+# Release artifacts generated at publish time (uploaded as gh release assets, not committed)
+/SHA256SUMS.txt
+/RELEASE_NOTES.md

@@ -1,90 +1,94 @@
 #!/usr/bin/env python3
-"""Generate the placeholder Corvus Capture crow icon.
+"""Generate the Corvus Capture tray icon from the logo artwork.
 
-Draws a simple flat black crow silhouette (head, body, beak, tail wedge) on a
-transparent background at 256x256, then downsamples with a high-quality
-filter to produce the 16/32/48/256 px frames baked into resources/corvus.ico.
+Cuts the crow-on-photo-frame motif out of ``resources/corvus_logo.png``
+(white background made transparent), composes it at 88% scale on a light
+grey (#D9D9D9) disc, and emits 16/32/48/256 px frames into
+``resources/corvus.ico``. The disc keeps the near-black crow visible on
+the Windows 11 dark taskbar without needing an outline ring.
 
-Re-run this script any time the placeholder icon needs to be regenerated
-(e.g. after tweaking the silhouette). Phase 5 replaces this with final
-branding — likely a new script or a hand-authored .ico, per D-05 (file swap
-only, no code change expected in build.rs/app.rc).
+Re-run this script any time the icon needs to be regenerated (e.g. after
+replacing the logo art). Design chosen by the user from generated samples
+(2026-09-03): "crow + frame on a light grey circle, bigger crow".
 
 Requires: Pillow (`pip install pillow`)
 """
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 SIZES = [16, 32, 48, 256]
-CANVAS = 256
-OUT_PATH = Path(__file__).resolve().parent.parent / "resources" / "corvus.ico"
+CANVAS = 512
+DISC_COLOR = (217, 217, 217)  # light grey #D9D9D9
+INNER_FRAC = 0.88             # crow+frame size relative to the disc canvas
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC_PATH = ROOT / "resources" / "corvus_logo.png"
+OUT_PATH = ROOT / "resources" / "corvus.ico"
+
+# Crop box for the crow + photo frame, in the logo's original 1233px
+# coordinate space (scaled to the actual source size at runtime).
+CROP_REF = 1233.0
+CROP_BOX = (280, 150, 880, 900)
 
 
-def draw_crow(size: int) -> Image.Image:
-    """Draw a flat black crow silhouette on a transparent canvas."""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    black = (0, 0, 0, 255)
-
-    # Body: rounded torso, slightly tilted, sitting pose.
-    draw.ellipse([50, 110, 200, 220], fill=black)
-
-    # Tail: wedge trailing behind/below the body (screen-left, pointing down-left).
-    draw.polygon(
-        [(70, 190), (10, 245), (95, 215)],
-        fill=black,
-    )
-
-    # Head: round, overlapping the top of the body.
-    draw.ellipse([130, 40, 220, 130], fill=black)
-
-    # Beak: triangular wedge pointing right from the head.
-    draw.polygon(
-        [(212, 78), (250, 92), (212, 108)],
-        fill=black,
-    )
-
+def white_to_alpha(img: Image.Image) -> Image.Image:
+    """Near-white background -> transparent, with a soft feather edge."""
+    img = img.convert("RGBA")
+    px = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            m = (r + g + b) / 3
+            if m > 240:
+                px[x, y] = (r, g, b, 0)
+            elif m > 210:
+                px[x, y] = (r, g, b, int(255 * (240 - m) / 30))
     return img
 
 
-def add_white_outline(img: Image.Image) -> Image.Image:
-    """Composites a white ring around `img`'s silhouette so the crow reads
-    clearly against a dark taskbar at real 16x16 tray size (RESEARCH.md
-    Pattern 2). Dilates the alpha channel with a MaxFilter sized to the
-    frame (ring ~= size/8 px) to build the ring mask, then alpha-composites
-    the original black crow back on top. Applied per-frame AFTER resizing —
-    outlining only the 256px master and downsampling shrinks the ring to a
-    fraction of a pixel at 16x16, making it invisible."""
-    size = img.size[0]
-    kernel = 2 * max(2, size // 8) + 1  # odd; ring thickness = (kernel-1)/2
-    alpha = img.split()[3]
-    dilated_alpha = alpha.filter(ImageFilter.MaxFilter(kernel))
+def autocrop(img: Image.Image, pad: int = 12) -> Image.Image:
+    l, t, r, b = img.split()[3].getbbox()
+    return img.crop((
+        max(0, l - pad), max(0, t - pad),
+        min(img.width, r + pad), min(img.height, b + pad),
+    ))
 
-    white_ring = Image.new("RGBA", img.size, (255, 255, 255, 0))
-    white_ring.putalpha(dilated_alpha)
 
-    return Image.alpha_composite(white_ring, img)
+def squareize(img: Image.Image) -> Image.Image:
+    s = max(img.size)
+    base = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    base.paste(img, ((s - img.width) // 2, (s - img.height) // 2))
+    return base
+
+
+def build_master() -> Image.Image:
+    src = Image.open(SRC_PATH)
+    f = src.width / CROP_REF
+    box = tuple(int(v * f) for v in CROP_BOX)
+    motif = squareize(autocrop(white_to_alpha(src.crop(box))))
+
+    base = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
+    d = ImageDraw.Draw(base)
+    d.ellipse([4, 4, CANVAS - 4, CANVAS - 4], fill=DISC_COLOR + (255,))
+    n = int(CANVAS * INNER_FRAC)
+    inner = motif.resize((n, n), Image.LANCZOS)
+    base.alpha_composite(inner, ((CANVAS - n) // 2, (CANVAS - n) // 2))
+    return base
 
 
 def main() -> None:
-    crow = draw_crow(CANVAS)
-    frames = []
-    for size in SIZES:
-        if size == CANVAS:
-            frame = add_white_outline(crow)
-        else:
-            frame = add_white_outline(crow.resize((size, size), Image.LANCZOS))
-        frames.append(frame)
-    base = frames[SIZES.index(CANVAS)]
+    master = build_master()
+    frames = [master.resize((s, s), Image.LANCZOS) for s in SIZES]
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    base.save(
+    frames[-1].save(
         OUT_PATH,
         format="ICO",
         sizes=[(s, s) for s in SIZES],
-        append_images=[f for f in frames if f is not base],
+        append_images=frames[:-1],
     )
     print(f"Wrote {OUT_PATH} with frames: {SIZES}")
 

@@ -710,6 +710,29 @@ fn apply_control_themes(hwnd: HWND, dark: bool) {
         }
     }
 
+    // RESEARCH.md Pitfall 1/2 fallback: group-box and checkbox controls are
+    // BUTTON-class controls whose themed parts paint their own near-black
+    // label text, ignoring WM_CTLCOLORSTATIC's SetTextColor. Stripping
+    // theming (empty-string SetWindowTheme, not a dark class name) drops
+    // them back to classic rendering, which fully honors the handler
+    // already in place. Light mode must not touch these controls at all.
+    let strip = w!("");
+    for id in [
+        GRP_FILENAME,
+        GRP_FORMAT,
+        GRP_BEHAVIOR,
+        constants::ID_TOAST_CHECK,
+        constants::ID_CLIPBOARD_CHECK,
+        constants::ID_STARTUP_CHECK,
+        constants::ID_SHUTTER_CHECK,
+    ] {
+        if let Ok(ctrl) = unsafe { GetDlgItem(Some(hwnd), id) } {
+            unsafe {
+                let _ = SetWindowTheme(ctrl, if dark { strip } else { stock }, if dark { strip } else { stock });
+            }
+        }
+    }
+
     for id in [constants::ID_FORMAT_COMBO, constants::ID_CLICK_ACTION_COMBO] {
         if let Ok(combo) = unsafe { GetDlgItem(Some(hwnd), id) } {
             let mut info = COMBOBOXINFO {

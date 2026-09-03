@@ -1,0 +1,107 @@
+# Release Runbook
+
+This document records the code-signing decision for Corvus Capture releases and the
+post-publish procedures that must be completed before a release is announced.
+
+## Code-signing decision (v0.1.0)
+
+**Decision: no certificate.** Corvus Capture v0.1.0 ships unsigned.
+
+**Rationale:**
+
+- An EV (Extended Validation) code-signing certificate costs roughly $300-500+/yr and
+  requires business identity vetting (Dun & Bradstreet lookup, notarized documents, etc.).
+  That cost and process is not justified for a free, solo-maintained utility.
+- A cheaper OV (Organization Validation) certificate does **not** solve the problem it might
+  appear to solve: since a Microsoft policy change circa 2020, only EV certificates grant
+  instant SmartScreen application reputation. An OV certificate would remove the "unknown
+  publisher" ambiguity in the file's properties, but Windows SmartScreen would still show
+  the same "Windows protected your PC" reputation-based warning until enough
+  downloads/time accrue reputation for that binary. Paying for an OV cert would therefore
+  add cost without removing the SmartScreen prompt users actually see.
+  *(This EV-vs-OV distinction is treated as an assumption to re-verify — see
+  `.planning/phases/05-release-hardening-distribution/05-RESEARCH.md` Assumption A2 — if
+  code-signing is reconsidered for a future release.)*
+
+**Executed alternative (compensating controls):**
+
+1. Publish a SHA-256 checksum of the exact released binary as an immutable GitHub release
+   asset (`SHA256SUMS.txt`), not as editable release-notes text, so it cannot be silently
+   altered after publication.
+2. Submit the binary to Microsoft for both AV false-positive analysis and SmartScreen
+   application-reputation analysis (see the next section).
+3. Document the SmartScreen "More info -> Run anyway" bypass for early adopters in the
+   release notes and README, conditioned on checksum verification first.
+
+**v0.1.0 release details:**
+
+- Date: 2026-09-03
+- SHA-256: `37B5D8816C9BB7D8A5803BDDE2AD39BC53BEE98FB3A13F614796E2161F4D546F`
+- Release: https://github.com/NYBaywatch/CorvusCapture/releases/tag/v0.1.0
+
+## Post-publish Microsoft submissions (manual)
+
+These are two separate Microsoft systems with separate review timelines. Both must be
+submitted; submitting only one leaves the other class of warning unresolved even if the
+other clears.
+
+1. **Portal 1 — AV false-positive submission (WDSI file submission).**
+   URL: https://www.microsoft.com/en-us/wdsi/filesubmission
+   Submit `CorvusCapture.exe` as a suspected false positive. Include the public release URL
+   (https://github.com/NYBaywatch/CorvusCapture/releases/tag/v0.1.0) and the SHA-256 hash
+   above as supporting detail. This addresses Microsoft Defender antivirus detections.
+
+2. **Portal 2 — SmartScreen application-reputation submission.**
+   URL: https://www.microsoft.com/en-us/wdsi/AppRepSubmission
+   Submit the same binary for the "unrecognized publisher" SmartScreen prompt
+   ("Windows protected your PC"). This is a distinct system from Portal 1 — reputation
+   here accrues from both explicit review and aggregate download volume/age.
+
+**Expected timeline:** The AV false-positive verdict from Portal 1 typically returns within
+days. SmartScreen reputation from Portal 2 accrues over a longer period tied to download
+volume and does not clear instantly, even after a clean AV verdict. **A persisting
+SmartScreen prompt after a clean AV verdict is the expected outcome for a new release, not
+a release blocker** — it is documented for users in the release notes and README rather
+than treated as something to fix before announcing.
+
+## Fresh-VM Mark-of-the-Web verification (required before announcement)
+
+This test confirms a stranger's actual download-and-run experience matches what the
+release notes promise. It must be performed on a clean Windows 11 VM with Microsoft
+Defender enabled and current virus definitions — not on a development machine, and not by
+copying the file over a network share or local copy (that does not apply a Mark-of-the-Web
+zone identifier and will not reproduce the SmartScreen condition a real downloader hits).
+
+**Procedure:**
+
+1. On the clean VM, open a browser and download `CorvusCapture.exe` directly from the
+   public release page (https://github.com/NYBaywatch/CorvusCapture/releases/tag/v0.1.0),
+   not via a network share or removable media copy.
+2. Confirm the file carries the Mark-of-the-Web zone identifier:
+   ```
+   Get-Content -Path CorvusCapture.exe -Stream Zone.Identifier
+   ```
+   This must return zone data (e.g. `ZoneId=3`) confirming Windows marked the file as
+   downloaded from the internet.
+3. Verify the checksum against the published hash:
+   ```
+   certutil -hashfile CorvusCapture.exe SHA256
+   ```
+   Compare the output to `37B5D8816C9BB7D8A5803BDDE2AD39BC53BEE98FB3A13F614796E2161F4D546F`.
+4. Run the exe. Record whether Microsoft Defender flags it, and exactly what SmartScreen
+   shows (if anything).
+5. If SmartScreen appears, click `More info`, then `Run anyway`, and confirm the tray icon
+   appears and pressing `F9` produces a saved file.
+6. Record the observed outcome and the date below.
+
+**Announcement gate:** v0.1.0 may only be announced publicly after this section records a
+**pass** (Defender clean; SmartScreen prompt, if any, bypassable via `More info` -> `Run
+anyway` and consistent with the README's documented workaround).
+
+### Result
+
+- Date: _(not yet performed)_
+- Defender verdict: _(pending)_
+- SmartScreen outcome: _(pending)_
+- Tray icon / F9 capture confirmed: _(pending)_
+- **Pass/Fail:** _(pending — announcement is blocked until this is filled in with a pass)_

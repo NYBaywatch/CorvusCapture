@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".planning/**"
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      # Cargo prints "`panic` setting is ignored for `bench` profile" because
+      # [profile.release] sets panic = "abort" — this is expected and harmless.
+      - name: Test
+        run: cargo test --release
+
+      # Clippy runs at warn level (deny-on-warnings intentionally omitted) because the baseline is not
+      # clean. Known baseline (4 warnings, 0 errors) as of 2026-09-03:
+      #   - src/overlay.rs:1506  unused_variables (`bounds`)
+      #   - src/clipboard.rs:92  clippy::unnecessary_cast
+      #   - src/settings.rs:559  clippy::too_many_arguments (11/7)
+      #   - src/save.rs:482 (test cfg)  clippy::field_reassign_with_default
+      # TODO: switch to deny-on-warnings once the baseline is cleaned up.
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # RustSec advisory DB against Cargo.lock. If this proves noisy on
+      # transitive Win32 crates, the follow-up is `cargo audit --ignore
+      # RUSTSEC-XXXX-XXXX` with a comment — do not blanket continue-on-error.
+      - name: Audit
+        run: cargo audit

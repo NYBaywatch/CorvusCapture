@@ -2,3 +2,5 @@
 
 # Rust build artifacts (Cargo.lock is committed — this is a binary crate)
 /target
+
+# .planning/ is intentionally local-only: GSD workflow artifacts, never published.

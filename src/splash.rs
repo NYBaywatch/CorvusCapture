@@ -13,8 +13,9 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::{PCWSTR, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromPoint, SetDIBitsToDevice, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
+    BeginPaint, CreateEllipticRgn, DeleteObject, EndPaint, GetMonitorInfoW, MonitorFromPoint,
+    SetDIBitsToDevice, SetWindowRgn, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -93,6 +94,12 @@ pub fn show() {
     if let Ok(hwnd) = result {
         *SPLASH_HWND.lock().unwrap() = Some(hwnd.0 as isize);
         unsafe {
+            // Circular splash: clip the square logo window to an ellipse.
+            // The region is owned by the system after SetWindowRgn succeeds.
+            let rgn = CreateEllipticRgn(0, 0, width, height);
+            if !rgn.is_invalid() && SetWindowRgn(hwnd, Some(rgn), true) == 0 {
+                let _ = DeleteObject(rgn.into());
+            }
             let _ = SetTimer(Some(hwnd), SPLASH_TIMER_ID, SPLASH_DURATION_MS, None);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }

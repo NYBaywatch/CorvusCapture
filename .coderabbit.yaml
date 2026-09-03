@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Enabling this repository in the CodeRabbit dashboard is a human step; the
+# App is already available to the NYBaywatch org.
+#
+# CodeRabbit's clippy integration is intentionally NOT enabled below (reviews.tools
+# left unset / default): this crate is Win32-only via the `windows` crate and does
+# not compile on Linux, which is what CodeRabbit's sandbox runs on. CI on
+# windows-latest (.github/workflows/ci.yml) owns the clippy gate instead.
+
+language: en-US
+early_access: false
+
+reviews:
+  # Solo-developer Rust project with a deliberately unsafe-heavy Win32 FFI
+  # surface; `assertive` would generate high-volume noise on every `unsafe`
+  # block and raw handle cast. Chill keeps signal high.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+
+  path_filters:
+    - "!docs/traffic-stats.json"
+    - "!target/**"
+    - "!Cargo.lock"
+    - "!SHA256SUMS.txt"
+    - "!resources/**"
+    - "!.planning/**"
+
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: >
+        Flag `unsafe` blocks whose safety invariants are not documented.
+        Flag unchecked Win32 HANDLE/HWND returns and missing resource cleanup
+        (GDI object leaks, DeleteObject/ReleaseDC/CloseHandle pairing).
+        Flag `.unwrap()`/`.expect()` on fallible Win32 calls in the hotkey hot
+        path. Flag any change that could regress the project's stated budgets
+        (<10 MB idle RAM, 0% idle CPU, <100 ms hotkey-to-file).
+    - path: ".github/workflows/**"
+      instructions: >
+        Check that GitHub Actions are pinned to a specific version and that
+        secrets are handled correctly (no secrets echoed to logs, least-
+        privilege permissions blocks).
+
+chat:
+  auto_reply: true

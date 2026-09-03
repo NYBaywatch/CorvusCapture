@@ -29,9 +29,9 @@ use crate::constants;
 pub const WINDOW_BG: u32 = 0x0020_2020;
 /// Dark control (label/edit/listbox) background.
 pub const CONTROL_BG: u32 = 0x002B_2B2B;
-/// Dark-mode text color: matrix green (`#00FF41`, COLORREF `0x00BBGGRR`
+/// Dark-mode text color: near-white (`#E0E0E0`, COLORREF `0x00BBGGRR`
 /// order).
-pub const TEXT_COLOR: u32 = 0x0041_FF00;
+pub const TEXT_COLOR: u32 = 0x00E0_E0E0;
 
 const AUTO_THEME_SUBKEY: PCWSTR =
     w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");

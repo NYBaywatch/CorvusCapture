@@ -4,9 +4,11 @@
 //! to follow the Windows system theme, including a live update when the
 //! user changes it while the window is open.
 //!
-//! Built entirely from documented/stable APIs (DWM title-bar attribute,
+//! Built mostly from documented/stable APIs (DWM title-bar attribute,
 //! `WM_CTLCOLOR*` handlers driven from here, `SetWindowTheme` dark
-//! classes) -- no undocumented uxtheme ordinals.
+//! classes), plus one best-effort undocumented uxtheme ordinal
+//! (`enable_dark_context_menus`) used only to dark-theme the native tray
+//! context menu, which has no documented dark-mode API.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -17,8 +19,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, GetSysColor, COLOR_BTNFACE, COLOR_WINDOW, COLOR_WINDOWTEXT,
     HBRUSH,
 };
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows::core::{w, PCWSTR, BOOL};
+use windows::core::{w, PCSTR, PCWSTR, BOOL};
 
 use crate::constants;
 
@@ -157,4 +160,33 @@ pub fn light_window_color() -> COLORREF {
 #[allow(dead_code)]
 pub fn light_control_color() -> COLORREF {
     COLORREF(unsafe { GetSysColor(COLOR_WINDOW) })
+}
+
+/// Best-effort dark-theming for native popup menus (the tray right-click
+/// context menu), via the undocumented `uxtheme.dll` ordinal 135
+/// (`SetPreferredAppMode`). There is no documented API for dark-themed
+/// native `HMENU` popups -- owner-drawing the menu was rejected as
+/// disproportionate complexity for a 4-item popup, so this mirrors the
+/// pattern reference dark-mode implementations (e.g. ysc3839/win32-darkmode)
+/// use. Loads the DLL and resolves the ordinal dynamically; if either step
+/// fails (missing export on a future/older Windows build) this silently
+/// does nothing -- no panic, no error, the menu simply stays light. Must be
+/// called before the menu (`HMENU`) is created. `uxtheme.dll` is already
+/// resident for a themed Win32 app, so the loaded-module reference is never
+/// freed -- consistent with this project's "don't over-engineer lifecycle
+/// for OS-resident DLLs" posture elsewhere in this file.
+pub fn enable_dark_context_menus() {
+    unsafe {
+        let name = w!("uxtheme.dll");
+        let Ok(module) = LoadLibraryW(name) else {
+            return;
+        };
+        let Some(addr) = GetProcAddress(module, PCSTR(135usize as *const u8)) else {
+            return;
+        };
+        let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+            std::mem::transmute(addr);
+        // 1 == AllowDark.
+        let _ = set_preferred_app_mode(1);
+    }
 }

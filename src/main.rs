@@ -208,6 +208,7 @@ fn main() {
     }
 
     let _hwnd = app::create_main_window().expect("failed to create main window");
+    theme::enable_dark_context_menus();
     let _tray = tray::init().expect("failed to create tray icon");
 
     // Phase 2 startup: the orphan `.tmp` sweep must finish and the save

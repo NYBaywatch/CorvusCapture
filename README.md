@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="resources/corvus_logo.png" width="280" alt="Corvus Capture logo">
+</p>
+
 # Corvus Capture
 
 **Hotkey-to-file screenshots, zero friction.**
@@ -6,6 +10,8 @@
 > detour, no bloat. Corvus Capture is a lightweight Windows 11 tray utility built for people
 > who screenshot constantly and just want the file to appear.
 
+[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/NYBaywatch/CorvusCapture/total?style=flat&logo=github&label=Downloads)](https://github.com/NYBaywatch/CorvusCapture/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/NYBaywatch/CorvusCapture?style=flat&logo=github)](https://github.com/NYBaywatch/CorvusCapture)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)

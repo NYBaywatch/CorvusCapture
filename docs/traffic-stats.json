@@ -94,6 +94,36 @@
       "timestamp": "2026-09-23T00:00:00Z",
       "count": 3,
       "uniques": 3
+    },
+    {
+      "timestamp": "2026-09-24T00:00:00Z",
+      "count": 12,
+      "uniques": 10
+    },
+    {
+      "timestamp": "2026-09-25T00:00:00Z",
+      "count": 21,
+      "uniques": 16
+    },
+    {
+      "timestamp": "2026-09-26T00:00:00Z",
+      "count": 24,
+      "uniques": 16
+    },
+    {
+      "timestamp": "2026-09-27T00:00:00Z",
+      "count": 12,
+      "uniques": 7
+    },
+    {
+      "timestamp": "2026-09-28T00:00:00Z",
+      "count": 17,
+      "uniques": 12
+    },
+    {
+      "timestamp": "2026-09-29T00:00:00Z",
+      "count": 18,
+      "uniques": 12
     }
   ],
   "views": [
@@ -189,6 +219,36 @@
     },
     {
       "timestamp": "2026-09-23T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-24T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-25T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-26T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-27T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-28T00:00:00Z",
+      "count": 0,
+      "uniques": 0
+    },
+    {
+      "timestamp": "2026-09-29T00:00:00Z",
       "count": 0,
       "uniques": 0
     }
@@ -300,6 +360,16 @@
         {
           "referrer": "github.com",
           "count": 4,
+          "uniques": 2
+        }
+      ]
+    },
+    {
+      "date": "2026-09-30",
+      "sources": [
+        {
+          "referrer": "github.com",
+          "count": 3,
           "uniques": 2
         }
       ]
@@ -490,6 +560,17 @@
           "title": "/releases",
           "count": 1,
           "uniques": 1
+        }
+      ]
+    },
+    {
+      "date": "2026-09-30",
+      "pages": [
+        {
+          "path": "/NYBaywatch/CorvusCapture",
+          "title": "Overview",
+          "count": 3,
+          "uniques": 2
         }
       ]
     }
@@ -717,6 +798,28 @@
     },
     {
       "date": "2026-09-29",
+      "releases": [
+        {
+          "tag_name": "v0.1.0",
+          "published_at": "2026-09-03T16:34:13Z",
+          "assets": [
+            {
+              "name": "CorvusCapture.exe",
+              "download_count": 8,
+              "size": 1196696
+            },
+            {
+              "name": "SHA256SUMS.txt",
+              "download_count": 0,
+              "size": 84
+            }
+          ]
+        }
+      ],
+      "total_downloads": 8
+    },
+    {
+      "date": "2026-09-30",
       "releases": [
         {
           "tag_name": "v0.1.0",

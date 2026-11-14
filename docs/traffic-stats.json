@@ -344,6 +344,11 @@
       "timestamp": "2026-11-12T00:00:00Z",
       "count": 1,
       "uniques": 1
+    },
+    {
+      "timestamp": "2026-11-13T00:00:00Z",
+      "count": 13,
+      "uniques": 9
     }
   ],
   "views": [
@@ -691,6 +696,11 @@
       "timestamp": "2026-11-12T00:00:00Z",
       "count": 0,
       "uniques": 0
+    },
+    {
+      "timestamp": "2026-11-13T00:00:00Z",
+      "count": 0,
+      "uniques": 0
     }
   ],
   "referrers": [
@@ -1012,6 +1022,10 @@
     },
     {
       "date": "2026-11-13",
+      "sources": []
+    },
+    {
+      "date": "2026-11-14",
       "sources": []
     }
   ],
@@ -1416,6 +1430,10 @@
     },
     {
       "date": "2026-11-13",
+      "pages": []
+    },
+    {
+      "date": "2026-11-14",
       "pages": []
     }
   ],
@@ -2632,6 +2650,28 @@
     },
     {
       "date": "2026-11-13",
+      "releases": [
+        {
+          "tag_name": "v0.1.0",
+          "published_at": "2026-09-03T16:34:13Z",
+          "assets": [
+            {
+              "name": "CorvusCapture.exe",
+              "download_count": 8,
+              "size": 1196696
+            },
+            {
+              "name": "SHA256SUMS.txt",
+              "download_count": 0,
+              "size": 84
+            }
+          ]
+        }
+      ],
+      "total_downloads": 8
+    },
+    {
+      "date": "2026-11-14",
       "releases": [
         {
           "tag_name": "v0.1.0",
